@@ -61,38 +61,6 @@ This file currently serves as the rule specification for the trade-validation po
 
 ---
 
-### `README.md`
-
-Documentation for the project, including its purpose, current components, and development progress.
-
-## How the Components Fit Together
-
-The basic structure of the project is:
-
-`salary_collector.py`
-
-↓  
-
-`nba_contracts.xlsx`
-
-↓  
-
-**Player / Team Salary Data**
-
-+
-
-`NBA Trade CBA Rules Reference.txt`
-
-↓
-
-**Trade Legality Rules**
-
-↓
-
-**NBA Trading Engine**
-
-The contract dataset provides the financial inputs for a trade, while the CBA reference defines the constraints that determine whether that trade is permitted.
-
 ## Development Roadmap
 
 The project is being developed incrementally.
