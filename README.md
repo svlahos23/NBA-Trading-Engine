@@ -71,17 +71,6 @@ The project is being developed incrementally.
 - Create a structured contract dataset
 - Research and document NBA CBA trade restrictions
 
-### Next
-
-- Convert CBA trade rules into Python validation functions
-- Calculate team salary positions
-- Determine applicable salary-matching rules for each team
-- Validate individual players' trade eligibility
-- Validate draft-pick eligibility
-- Support multi-player and multi-team transactions
-- Automatically reject illegal trade constructions
-- Generate viable trade combinations for selected players and/or draft picks
-
 ### Longer Term
 
 The goal is to move beyond simply checking whether a manually entered trade works.
@@ -92,8 +81,6 @@ The engine will eventually be able to search possible transactions automatically
 2. Player and draft-pick eligibility rules
 3. Team salary constraints
 4. User-defined trade objectives
-
-This creates the foundation for a broader basketball-operations decision-support tool rather than a basic trade-machine salary checker.
 
 ## Project Status
 
