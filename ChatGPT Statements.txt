@@ -1,0 +1,37 @@
+﻿Creating a List of Players’ Strengths and Weaknesses: “This is a list of current players for each team (will be inputted dynamically). Return a list of 10 player strengths and 10 player weaknesses based on skills (shooting, passing, perimeter defense, interior defense, basketball IQ, etc.). Be stringent and true with what their current abilities are, not what they were or could be. Also, for each player generate a list of features that describe the player physically and mentally (age, young/veteran, speed, vertical, temperament, playoff riser, clutch, choker, etc.). For each team, a list should be returned in the following format:
+“Team Name:
+
+
+Player Name: Attributes (List), Strengths (List), Weaknesses (List)
+Player Name 2: Attributes (List), Strengths (List), Weaknesses (List)
+So on and so on…””
+
+
+ChatGPT Intro to Parse Basic Trade Ideas: From this statement, you must parse multiple pieces of information. The team the user is working for, which players (or what type of players) they are looking for to join their team, what players (or what type of players) they are willing to part with for this trade, what players (or what type of players) on their team are untouchable, what players you would like avoid acquiring, and what weaknesses they want to avoid in acquired players. Return the information in the following format:
+
+
+“Team Name: [Insert Team Name]
+Players Wanted: [Insert Player Names]
+Player Types Wanted: [Insert Player Types Wanted]
+Players Willing to Part With: [Insert Players Willing to Part With]
+Untouchable Players: [Insert Untouchable Players]
+Untouchable Player Types: [Insert Untouchable Player Types]
+Players to Avoid: [Insert Players to Avoid]
+Types of Players to Avoid: [Insert Types of Players to Avoid]
+Teams to Avoid: [Insert Teams to Avoid]”
+
+
+Reducing the Search Space Based on the User’s Demands: “Using the info in the formatted information, reduce the tradeable players on the user’s team (based on untouchable players and untouchable player types) using player names and strength/weakness keywords associated with each player. Reduce the tradeable players from every other team in the same way using players to avoid and types of players to avoid. Eliminate any teams that the user doesn’t want to trade with. Do not remove players that the user’s team wants to trade for no matter what. Return a list in this format where each team has a title name with remaining names that are allowable:
+
+
+“Team Name: Player Names in a comma list
+2nd Team Name: Player Names in a comma list
+So on and so on…”
+
+
+Use this information to return another list in the same format. This time, filter the remaining players based on if they are the player types wanted or the player wanted itself. Return it in the same following format: 
+
+
+“Team Name: Player Names in a comma list
+2nd Team Name: Player Names in a comma list
+So on and so on…””
