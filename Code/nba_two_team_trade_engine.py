@@ -1,0 +1,2195 @@
+"""Two-team NBA trade generator integrated with the supplied 2026-27 CBA validator.
+
+Single public entry point:
+    generate_legal_two_team_trades(workbook_path, user_preferences_string)
+
+The preference-processing/OpenAI prompts run UPSTREAM and are not reproduced here.
+The second argument is a string containing the user's team plus the two upstream
+allowable-player/target-player dictionaries. See examples at the bottom.
+
+Exhaustively enumerates two-team PLAYER-ONLY trades meeting the preferences,
+using constraint pruning before the full CBA validator. Streams results lazily
+so it does not hold an exponential number of trades in memory.
+
+A returned trade passes all CHECKABLE restrictions in the supplied validator.
+The workbook lacks some facts required for league certification. When facts are
+unavailable, the result includes unresolved_checks, not a legality guarantee.
+
+Dependency: pip install openpyxl
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from itertools import product as cartesian_product
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+import calendar
+
+from openpyxl import load_workbook
+
+
+Money = float
+PlayerKey = Tuple[str, str]
+
+
+# ---------------------------------------------------------------------------
+# 2026-27 system values from the supplied CBA reference.
+# The salary-matching tier values are described as approximate in the source,
+# so they live in SeasonRules rather than being buried in validation code.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SeasonRules:
+    season_start: int = 2026
+    salary_cap: Money = 164_961_000
+    luxury_tax: Money = 200_428_000
+    first_apron: Money = 209_015_000
+    second_apron: Money = 221_686_000
+
+    matching_cushion: Money = 250_000
+    expanded_low_threshold: Money = 8_846_000
+    expanded_middle_threshold: Money = 35_383_000
+    expanded_middle_addon: Money = 9_096_000
+
+    annual_cash_limit: Money = 8_495_000
+
+    # Rule 30: intentionally season-level/configurable, not hardcoded here.
+    trade_deadline: Optional[date] = None
+
+    # Rule 18: sign-and-trade must occur before regular season begins.
+    regular_season_start: Optional[date] = None
+
+    # Set True only when validating the post-deadline/postseason trade window.
+    postseason_trade_window_open: bool = False
+
+    # For 2026-27, the first future draft is normally 2027.
+    first_future_draft_year: int = 2027
+
+
+@dataclass(frozen=True)
+class PlayerData:
+    name: str
+    team: str
+    team_abbreviation: Optional[str]
+    salary: Money
+    season_start: int
+    player_option: bool
+    team_option: bool
+    qualifying_offer: bool
+    extension_eligible: bool
+    guarantee_deadline: bool
+    signed_year: Optional[int]
+    contract_type: str
+    contract_start: Optional[int]
+    contract_end: Optional[int]
+    contract_years: Optional[int]
+    contract_value: Optional[Money]
+    guaranteed_at_signing: Optional[Money]
+    practical_guaranteed: Optional[Money]
+
+
+@dataclass(frozen=True)
+class TeamData:
+    team: str
+    season_start: int
+    salary_cap: Money
+    active_cap: Money
+    total_cap_allocations: Money
+    cap_space: Money
+    first_apron: Money
+    first_apron_allocations: Money
+    first_apron_space: Money
+    second_apron: Money
+    second_apron_allocations: Money
+    second_apron_space: Money
+    above_cap: bool
+    above_first_apron: bool
+    above_second_apron: bool
+
+
+@dataclass(frozen=True)
+class DraftAsset:
+    team: str
+    draft_year: int
+    round: int
+    direction: str
+    asset: str
+    details: str
+    is_swap: bool
+    is_protected: bool
+    is_conditional: bool
+
+
+@dataclass(frozen=True)
+class TradeException:
+    amount: Money
+    expires: Optional[date] = None
+    hard_caps_first_apron: bool = False
+
+
+@dataclass(frozen=True)
+class Violation:
+    rule: str
+    code: str
+    message: str
+    team: Optional[str] = None
+    player: Optional[str] = None
+
+
+@dataclass
+class ValidationResult:
+    passes: bool
+    violations: List[Violation] = field(default_factory=list)
+    undetermined: List[str] = field(default_factory=list)
+    mechanisms: Dict[str, str] = field(default_factory=dict)
+    team_salary_detail: Dict[str, Dict[str, Money]] = field(default_factory=dict)
+
+    @property
+    def legal(self) -> bool:
+        """Alias used by callers that prefer `result.legal`."""
+        return self.passes
+
+
+@dataclass(frozen=True)
+class RejectedTrade:
+    index: int
+    trade: Mapping[str, Any]
+    result: ValidationResult
+
+
+@dataclass(frozen=True)
+class TeamFlow:
+    outgoing_players: Tuple[Tuple[str, str], ...]  # (player, destination)
+    incoming_players: Tuple[Tuple[str, str], ...]  # (player, origin)
+    cash_sent: Money
+    cash_received: Money
+    outgoing_picks: Tuple[Mapping[str, Any], ...]
+    incoming_picks: Tuple[Mapping[str, Any], ...]
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _as_money(value: Any, default: Money = 0.0) -> Money:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("$", "").replace(",", "")
+    if not text:
+        return default
+    return float(text)
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _as_date(value: Any) -> Optional[date]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        return date.fromisoformat(value.strip())
+    raise TypeError(f"Cannot convert {value!r} to date.")
+
+
+def _add_months(d: date, months: int) -> date:
+    month_index = (d.month - 1) + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _add_year(d: date) -> date:
+    try:
+        return d.replace(year=d.year + 1)
+    except ValueError:
+        # Feb. 29 -> Feb. 28 in a non-leap year.
+        return d.replace(month=2, day=28, year=d.year + 1)
+
+
+def _first_value(row: Mapping[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in row and row[name] not in (None, ""):
+            return row[name]
+    return None
+
+
+def _normalize_header(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower().replace(" ", "_").replace("/", "_")
+
+
+def _rows_to_dicts(headers: Sequence[Any], rows: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
+    keys = [_normalize_header(h) for h in headers]
+    output: List[Dict[str, Any]] = []
+    for row in rows:
+        if not any(value not in (None, "") for value in row):
+            continue
+        item = {
+            key: row[i] if i < len(row) else None
+            for i, key in enumerate(keys)
+            if key
+        }
+        output.append(item)
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Workbook loader
+# ---------------------------------------------------------------------------
+
+
+class EngineData:
+    """Normalized view of the uploaded NBA trade-engine workbook."""
+
+    SECTION_HEADINGS = {
+        "CONTRACTS",
+        "TRANSACTIONS",
+        "TEAM CAP / APRONS",
+        "TRADE EXCEPTIONS",
+        "CONTRACT DEADLINES",
+        "DRAFT ASSETS",
+    }
+
+    def __init__(self, season_start: int):
+        self.season_start = season_start
+        self.players: Dict[PlayerKey, PlayerData] = {}
+        self.teams: Dict[str, TeamData] = {}
+        self.draft_assets: Dict[str, List[DraftAsset]] = {}
+        self.trade_exceptions: Dict[str, List[TradeException]] = {}
+
+    @classmethod
+    def from_xlsx(cls, path: str | Path, season_start: int = 2026) -> "EngineData":
+        path = Path(path)
+        wb = load_workbook(path, read_only=True, data_only=True)
+        data = cls(season_start=season_start)
+
+        try:
+            for ws in wb.worksheets:
+                rows = [tuple(row) for row in ws.iter_rows(values_only=True)]
+                data._parse_team_sheet(ws.title, rows)
+        finally:
+            wb.close()
+
+        return data
+
+    def _parse_team_sheet(self, sheet_name: str, rows: Sequence[Sequence[Any]]) -> None:
+        sections: Dict[str, Tuple[int, int]] = {}
+        heading_positions: List[Tuple[int, str]] = []
+
+        for i, row in enumerate(rows):
+            first = row[0] if row else None
+            if first in self.SECTION_HEADINGS:
+                heading_positions.append((i, str(first)))
+
+        for pos, (start, heading) in enumerate(heading_positions):
+            end = heading_positions[pos + 1][0] if pos + 1 < len(heading_positions) else len(rows)
+            sections[heading] = (start, end)
+
+        if "CONTRACTS" in sections:
+            self._parse_contracts(sheet_name, rows, *sections["CONTRACTS"])
+        if "TEAM CAP / APRONS" in sections:
+            self._parse_cap(sheet_name, rows, *sections["TEAM CAP / APRONS"])
+        if "TRADE EXCEPTIONS" in sections:
+            self._parse_trade_exceptions(sheet_name, rows, *sections["TRADE EXCEPTIONS"])
+        if "DRAFT ASSETS" in sections:
+            self._parse_draft_assets(sheet_name, rows, *sections["DRAFT ASSETS"])
+
+    def _section_dicts(
+        self,
+        rows: Sequence[Sequence[Any]],
+        start: int,
+        end: int,
+    ) -> List[Dict[str, Any]]:
+        if start + 1 >= end:
+            return []
+        headers = rows[start + 1]
+        if not headers or headers[0] in (None, "Info"):
+            return []
+        return _rows_to_dicts(headers, rows[start + 2 : end])
+
+    def _parse_contracts(
+        self,
+        sheet_name: str,
+        rows: Sequence[Sequence[Any]],
+        start: int,
+        end: int,
+    ) -> None:
+        for row in self._section_dicts(rows, start, end):
+            if _as_int(row.get("season_start")) != self.season_start:
+                continue
+            name = str(row.get("name") or "").strip()
+            team = str(row.get("team") or sheet_name).strip()
+            if not name:
+                continue
+
+            self.players[(team, name)] = PlayerData(
+                name=name,
+                team=team,
+                team_abbreviation=(str(row.get("team_abbreviation")) if row.get("team_abbreviation") else None),
+                salary=_as_money(row.get("salary")),
+                season_start=self.season_start,
+                player_option=_as_bool(row.get("player_option")),
+                team_option=_as_bool(row.get("team_option")),
+                qualifying_offer=_as_bool(row.get("qualifying_offer")),
+                extension_eligible=_as_bool(row.get("extension_eligible")),
+                guarantee_deadline=_as_bool(row.get("guarantee_deadline")),
+                signed_year=_as_int(row.get("signed_year")),
+                contract_type=str(row.get("contract_type") or ""),
+                contract_start=_as_int(row.get("contract_start")),
+                contract_end=_as_int(row.get("contract_end")),
+                contract_years=_as_int(row.get("contract_years")),
+                contract_value=(None if row.get("contract_value") in (None, "") else _as_money(row.get("contract_value"))),
+                guaranteed_at_signing=(None if row.get("guaranteed_at_signing") in (None, "") else _as_money(row.get("guaranteed_at_signing"))),
+                practical_guaranteed=(None if row.get("practical_guaranteed") in (None, "") else _as_money(row.get("practical_guaranteed"))),
+            )
+
+    def _parse_cap(
+        self,
+        sheet_name: str,
+        rows: Sequence[Sequence[Any]],
+        start: int,
+        end: int,
+    ) -> None:
+        for row in self._section_dicts(rows, start, end):
+            if _as_int(row.get("season_start")) != self.season_start:
+                continue
+            team = str(row.get("team") or sheet_name).strip()
+            self.teams[team] = TeamData(
+                team=team,
+                season_start=self.season_start,
+                salary_cap=_as_money(row.get("salary_cap")),
+                active_cap=_as_money(row.get("active_cap")),
+                total_cap_allocations=_as_money(row.get("total_cap_allocations")),
+                cap_space=_as_money(row.get("cap_space")),
+                first_apron=_as_money(row.get("first_apron")),
+                first_apron_allocations=_as_money(row.get("first_apron_allocations")),
+                first_apron_space=_as_money(row.get("first_apron_space")),
+                second_apron=_as_money(row.get("second_apron")),
+                second_apron_allocations=_as_money(row.get("second_apron_allocations")),
+                second_apron_space=_as_money(row.get("second_apron_space")),
+                above_cap=_as_bool(row.get("above_cap")),
+                above_first_apron=_as_bool(row.get("above_first_apron")),
+                above_second_apron=_as_bool(row.get("above_second_apron")),
+            )
+            break
+
+    def _parse_trade_exceptions(
+        self,
+        sheet_name: str,
+        rows: Sequence[Sequence[Any]],
+        start: int,
+        end: int,
+    ) -> None:
+        # The supplied workbook currently has "No data found" here. This
+        # parser is intentionally schema-tolerant for future workbook versions.
+        parsed = self._section_dicts(rows, start, end)
+        exceptions: List[TradeException] = []
+
+        for row in parsed:
+            amount_raw = _first_value(
+                row,
+                "remaining_amount",
+                "amount_remaining",
+                "amount",
+                "trade_exception_amount",
+                "tpe_amount",
+                "value",
+            )
+            if amount_raw in (None, ""):
+                continue
+
+            expires_raw = _first_value(
+                row,
+                "expiration_date",
+                "expires",
+                "expiry_date",
+            )
+            expires = None
+            if isinstance(expires_raw, datetime):
+                expires = expires_raw.date()
+            elif isinstance(expires_raw, date):
+                expires = expires_raw
+            elif isinstance(expires_raw, str) and expires_raw.strip():
+                try:
+                    expires = date.fromisoformat(expires_raw.strip())
+                except ValueError:
+                    expires = None
+
+            exceptions.append(
+                TradeException(
+                    amount=_as_money(amount_raw),
+                    expires=expires,
+                    hard_caps_first_apron=_as_bool(
+                        _first_value(row, "hard_caps_first_apron", "first_apron_hard_cap")
+                    ),
+                )
+            )
+
+        if exceptions:
+            self.trade_exceptions[sheet_name] = exceptions
+
+    def _parse_draft_assets(
+        self,
+        sheet_name: str,
+        rows: Sequence[Sequence[Any]],
+        start: int,
+        end: int,
+    ) -> None:
+        assets: List[DraftAsset] = []
+        for row in self._section_dicts(rows, start, end):
+            year = _as_int(row.get("draft_year"))
+            rnd = _as_int(row.get("round"))
+            if year is None or rnd is None:
+                continue
+            assets.append(
+                DraftAsset(
+                    team=str(row.get("team") or sheet_name),
+                    draft_year=year,
+                    round=rnd,
+                    direction=str(row.get("direction") or "").upper(),
+                    asset=str(row.get("asset") or ""),
+                    details=str(row.get("details") or ""),
+                    is_swap=_as_bool(row.get("is_swap")),
+                    is_protected=_as_bool(row.get("is_protected")),
+                    is_conditional=_as_bool(row.get("is_conditional")),
+                )
+            )
+        if assets:
+            self.draft_assets[sheet_name] = assets
+
+
+# ---------------------------------------------------------------------------
+# Validator
+# ---------------------------------------------------------------------------
+
+
+class CBAValidator:
+    def __init__(
+        self,
+        data: EngineData,
+        trade_date: date,
+        rules: Optional[SeasonRules] = None,
+        player_overrides: Optional[Mapping[PlayerKey, Mapping[str, Any]]] = None,
+        team_overrides: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ):
+        self.data = data
+        self.trade_date = trade_date
+        self.rules = rules or SeasonRules(season_start=data.season_start)
+        self.player_overrides: Mapping[PlayerKey, Mapping[str, Any]] = player_overrides or {}
+        self.team_overrides: Mapping[str, Mapping[str, Any]] = team_overrides or {}
+
+    @classmethod
+    def from_xlsx(
+        cls,
+        path: str | Path,
+        trade_date: date,
+        rules: Optional[SeasonRules] = None,
+        player_overrides: Optional[Mapping[PlayerKey, Mapping[str, Any]]] = None,
+        team_overrides: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    ) -> "CBAValidator":
+        resolved_rules = rules or SeasonRules()
+        data = EngineData.from_xlsx(path, season_start=resolved_rules.season_start)
+        return cls(
+            data=data,
+            trade_date=trade_date,
+            rules=resolved_rules,
+            player_overrides=player_overrides,
+            team_overrides=team_overrides,
+        )
+
+    # ------------------------- public API ---------------------------------
+
+    def validate_trade(self, trade: Mapping[str, Any]) -> ValidationResult:
+        violations: List[Violation] = []
+        undetermined: List[str] = []
+        mechanisms: Dict[str, str] = {}
+        team_salary_detail: Dict[str, Dict[str, Money]] = {}
+
+        flows = self._build_team_flows(trade, violations)
+        if not flows:
+            if not violations:
+                violations.append(
+                    Violation(
+                        rule="Structure",
+                        code="NO_PARTICIPANTS",
+                        message="Trade has no participating teams/moves.",
+                    )
+                )
+            return ValidationResult(False, violations, undetermined, mechanisms, team_salary_detail)
+
+        self._validate_trade_deadline(violations)
+        self._validate_player_ownership_and_eligibility(flows, violations, undetermined)
+
+        # Only perform salary math for teams whose player references are known.
+        self._validate_each_team_salary(
+            flows,
+            violations,
+            undetermined,
+            mechanisms,
+            team_salary_detail,
+        )
+
+        self._validate_cash(flows, violations, undetermined, team_salary_detail)
+        self._validate_draft_assets(flows, violations, undetermined)
+
+        return ValidationResult(
+            passes=not violations,
+            violations=violations,
+            undetermined=undetermined,
+            mechanisms=mechanisms,
+            team_salary_detail=team_salary_detail,
+        )
+
+    def is_trade_legal(self, trade: Mapping[str, Any]) -> bool:
+        return self.validate_trade(trade).passes
+
+    def iter_legal_trades(
+        self,
+        trades: Iterable[Mapping[str, Any]],
+    ) -> Iterator[Mapping[str, Any]]:
+        """Memory-friendly filter for generic trade-variation iterables."""
+        for trade in trades:
+            if self.validate_trade(trade).passes:
+                yield trade
+
+    def filter_trades(
+        self,
+        trades: Iterable[Mapping[str, Any]],
+        *,
+        keep_rejections: bool = False,
+        rejection_limit: Optional[int] = None,
+    ) -> Tuple[List[Mapping[str, Any]], List[RejectedTrade]]:
+        legal: List[Mapping[str, Any]] = []
+        rejected: List[RejectedTrade] = []
+
+        for index, trade in enumerate(trades):
+            result = self.validate_trade(trade)
+            if result.passes:
+                legal.append(trade)
+            elif keep_rejections and (
+                rejection_limit is None or len(rejected) < rejection_limit
+            ):
+                rejected.append(RejectedTrade(index=index, trade=trade, result=result))
+
+        return legal, rejected
+
+    # ------------------------- trade normalization ------------------------
+
+    def _build_team_flows(
+        self,
+        trade: Mapping[str, Any],
+        violations: List[Violation],
+    ) -> Dict[str, TeamFlow]:
+        outgoing_players: Dict[str, List[Tuple[str, str]]] = {}
+        incoming_players: Dict[str, List[Tuple[str, str]]] = {}
+        outgoing_picks: Dict[str, List[Mapping[str, Any]]] = {}
+        incoming_picks: Dict[str, List[Mapping[str, Any]]] = {}
+        cash_sent: Dict[str, Money] = {}
+        cash_received: Dict[str, Money] = {}
+
+        seen_player_moves: set[PlayerKey] = set()
+
+        moves = trade.get("moves", ())
+        if not isinstance(moves, (tuple, list)):
+            violations.append(
+                Violation(
+                    rule="Structure",
+                    code="MOVES_NOT_SEQUENCE",
+                    message="trade['moves'] must be a list or tuple.",
+                )
+            )
+            return {}
+
+        for move_index, move in enumerate(moves):
+            if not isinstance(move, Mapping):
+                violations.append(
+                    Violation(
+                        rule="Structure",
+                        code="MOVE_NOT_MAPPING",
+                        message=f"Move #{move_index} is not a mapping.",
+                    )
+                )
+                continue
+
+            from_team = str(move.get("from_team") or "").strip()
+            to_team = str(move.get("to_team") or "").strip()
+            if not from_team or not to_team or from_team == to_team:
+                violations.append(
+                    Violation(
+                        rule="Structure",
+                        code="INVALID_MOVE_TEAMS",
+                        message=f"Move #{move_index} has invalid from/to teams.",
+                        team=from_team or to_team or None,
+                    )
+                )
+                continue
+
+            outgoing_players.setdefault(from_team, [])
+            incoming_players.setdefault(from_team, [])
+            outgoing_players.setdefault(to_team, [])
+            incoming_players.setdefault(to_team, [])
+            outgoing_picks.setdefault(from_team, [])
+            incoming_picks.setdefault(from_team, [])
+            outgoing_picks.setdefault(to_team, [])
+            incoming_picks.setdefault(to_team, [])
+            cash_sent.setdefault(from_team, 0.0)
+            cash_received.setdefault(from_team, 0.0)
+            cash_sent.setdefault(to_team, 0.0)
+            cash_received.setdefault(to_team, 0.0)
+
+            players = move.get("players", ()) or ()
+            for player_raw in players:
+                player = str(player_raw).strip()
+                key = (from_team, player)
+                if key in seen_player_moves:
+                    violations.append(
+                        Violation(
+                            rule="Structure",
+                            code="PLAYER_MOVED_TWICE",
+                            message=f"{player} is sent more than once by {from_team}.",
+                            team=from_team,
+                            player=player,
+                        )
+                    )
+                    continue
+                seen_player_moves.add(key)
+                outgoing_players[from_team].append((player, to_team))
+                incoming_players[to_team].append((player, from_team))
+
+            picks = move.get("picks", ()) or ()
+            for pick_raw in picks:
+                if not isinstance(pick_raw, Mapping):
+                    violations.append(
+                        Violation(
+                            rule="25-29",
+                            code="INVALID_PICK_OBJECT",
+                            message="Each move['picks'] entry must be a mapping.",
+                            team=from_team,
+                        )
+                    )
+                    continue
+                pick = dict(pick_raw)
+                outgoing_picks[from_team].append(pick)
+                incoming_picks[to_team].append(pick)
+
+            cash = _as_money(move.get("cash"), 0.0)
+            if cash < 0:
+                violations.append(
+                    Violation(
+                        rule="24",
+                        code="NEGATIVE_CASH",
+                        message="Cash consideration cannot be negative.",
+                        team=from_team,
+                    )
+                )
+            elif cash:
+                cash_sent[from_team] += cash
+                cash_received[to_team] += cash
+
+        teams = set(outgoing_players) | set(incoming_players)
+        flows: Dict[str, TeamFlow] = {}
+        for team in teams:
+            flows[team] = TeamFlow(
+                outgoing_players=tuple(outgoing_players.get(team, ())),
+                incoming_players=tuple(incoming_players.get(team, ())),
+                cash_sent=cash_sent.get(team, 0.0),
+                cash_received=cash_received.get(team, 0.0),
+                outgoing_picks=tuple(outgoing_picks.get(team, ())),
+                incoming_picks=tuple(incoming_picks.get(team, ())),
+            )
+
+        # If trade['teams'] is supplied, ensure every declared team participates.
+        declared = trade.get("teams")
+        if declared:
+            declared_set = {str(t) for t in declared}
+            actual_set = set(flows)
+            if declared_set != actual_set:
+                violations.append(
+                    Violation(
+                        rule="31",
+                        code="DECLARED_TEAM_MISMATCH",
+                        message=(
+                            f"Declared teams {sorted(declared_set)} do not match teams "
+                            f"actually present in moves {sorted(actual_set)}."
+                        ),
+                    )
+                )
+
+        return flows
+
+    # ------------------------- rule helpers -------------------------------
+
+    def _player_override(self, team: str, player: str) -> Mapping[str, Any]:
+        return self.player_overrides.get((team, player), {})
+
+    def _team_override(self, team: str) -> Mapping[str, Any]:
+        return self.team_overrides.get(team, {})
+
+    def _player_data(self, team: str, player: str) -> Optional[PlayerData]:
+        return self.data.players.get((team, player))
+
+    def _team_data(self, team: str) -> Optional[TeamData]:
+        return self.data.teams.get(team)
+
+    def _outgoing_trade_salary(self, origin: str, player: str) -> Money:
+        override = self._player_override(origin, player)
+        if override.get("outgoing_trade_salary") not in (None, ""):
+            return _as_money(override["outgoing_trade_salary"])
+        p = self._player_data(origin, player)
+        return p.salary if p else 0.0
+
+    def _incoming_trade_salary(self, origin: str, player: str) -> Money:
+        override = self._player_override(origin, player)
+        if override.get("incoming_trade_salary") not in (None, ""):
+            return _as_money(override["incoming_trade_salary"])
+        p = self._player_data(origin, player)
+        return p.salary if p else 0.0
+
+    def _apron_salary(self, origin: str, player: str) -> Money:
+        override = self._player_override(origin, player)
+        if override.get("apron_salary") not in (None, ""):
+            return _as_money(override["apron_salary"])
+        # A trade kicker or special cap treatment can be represented by
+        # overriding apron_salary. Otherwise current salary is the best field
+        # present in the supplied workbook.
+        p = self._player_data(origin, player)
+        return p.salary if p else 0.0
+
+    # ------------------------- Rule 30 ------------------------------------
+
+    def _validate_trade_deadline(self, violations: List[Violation]) -> None:
+        deadline = self.rules.trade_deadline
+        if deadline is None:
+            return
+
+        if self.trade_date > deadline and not self.rules.postseason_trade_window_open:
+            violations.append(
+                Violation(
+                    rule="30",
+                    code="TRADE_DEADLINE_CLOSED",
+                    message=(
+                        f"Trade date {self.trade_date.isoformat()} is after the configured "
+                        f"trade deadline {deadline.isoformat()} and the postseason trade "
+                        "window is not marked open."
+                    ),
+                )
+            )
+
+    # ------------------------- Rules 7-23 player restrictions -------------
+
+    def _validate_player_ownership_and_eligibility(
+        self,
+        flows: Mapping[str, TeamFlow],
+        violations: List[Violation],
+        undetermined: List[str],
+    ) -> None:
+        for origin, flow in flows.items():
+            outgoing_count = len(flow.outgoing_players)
+
+            for player, destination in flow.outgoing_players:
+                pdata = self._player_data(origin, player)
+                if pdata is None:
+                    violations.append(
+                        Violation(
+                            rule="Structure",
+                            code="PLAYER_NOT_ON_ORIGIN_TEAM",
+                            message=(
+                                f"{player} does not have a {self.rules.season_start}-{str(self.rules.season_start + 1)[-2:]} "
+                                f"contract row for {origin} in the engine workbook."
+                            ),
+                            team=origin,
+                            player=player,
+                        )
+                    )
+                    continue
+
+                ov = self._player_override(origin, player)
+                ctype = pdata.contract_type.lower()
+
+                # Rule 7: newly signed standard free agent restriction.
+                # Do not apply this to the CURRENT sign-and-trade itself; Rule 18
+                # specifically governs that transaction. Historical S&T contract
+                # types are not automatically treated as a current S&T event.
+                current_sign_and_trade = _as_bool(ov.get("being_signed_and_traded"))
+                if (
+                    ctype.startswith("free agent")
+                    and pdata.signed_year == self.rules.season_start
+                    and not current_sign_and_trade
+                ):
+                    signed_date = _as_date(ov.get("signed_date"))
+                    dec15 = date(self.rules.season_start, 12, 15)
+
+                    if signed_date is not None:
+                        eligible = max(_add_months(signed_date, 3), dec15)
+                        if self.trade_date < eligible:
+                            violations.append(
+                                Violation(
+                                    rule="7",
+                                    code="NEW_FREE_AGENT_TRADE_RESTRICTION",
+                                    message=(
+                                        f"{player} is a current-cap-year free-agent signing and "
+                                        f"cannot be traded before {eligible.isoformat()}."
+                                    ),
+                                    team=origin,
+                                    player=player,
+                                )
+                            )
+                    elif self.trade_date < dec15:
+                        # Even without the exact signing date, the later-of rule
+                        # proves the player is ineligible before Dec. 15.
+                        violations.append(
+                            Violation(
+                                rule="7",
+                                code="NEW_FREE_AGENT_BEFORE_DEC15",
+                                message=(
+                                    f"{player} signed as a free agent in {self.rules.season_start} "
+                                    f"and the trade date is before {dec15.isoformat()}."
+                                ),
+                                team=origin,
+                                player=player,
+                            )
+                        )
+                    else:
+                        undetermined.append(
+                            f"Rule 7: exact signed_date missing for {origin} / {player}; "
+                            "three-month portion of the restriction cannot be proven."
+                        )
+
+                # Rule 8: January 15 restriction applies only when its factual
+                # predicates are satisfied. Workbook does not identify them.
+                if _as_bool(ov.get("jan15_restricted")):
+                    signed_date = _as_date(ov.get("signed_date"))
+                    jan15 = date(self.rules.season_start + 1, 1, 15)
+                    if signed_date is None:
+                        eligible = jan15
+                        undetermined.append(
+                            f"Rule 8: signed_date missing for Jan. 15 restricted player "
+                            f"{origin} / {player}; using Jan. 15 only is not sufficient to certify."
+                        )
+                    else:
+                        eligible = max(_add_months(signed_date, 3), jan15)
+                    if self.trade_date < eligible:
+                        violations.append(
+                            Violation(
+                                rule="8",
+                                code="JAN15_RESTRICTION",
+                                message=f"{player} is not trade eligible until {eligible.isoformat()}.",
+                                team=origin,
+                                player=player,
+                            )
+                        )
+
+                # Rule 9: newly signed draft pick, 30 days.
+                is_draft_rookie = ov.get("is_draft_rookie")
+                if is_draft_rookie is None:
+                    is_draft_rookie = pdata.contract_type.strip().lower() == "rookie"
+                if _as_bool(is_draft_rookie) and pdata.signed_year == self.rules.season_start:
+                    signed_date = _as_date(ov.get("signed_date"))
+                    if signed_date is None:
+                        undetermined.append(
+                            f"Rule 9: signed_date missing for draft rookie {origin} / {player}."
+                        )
+                    elif self.trade_date < signed_date + timedelta(days=30):
+                        violations.append(
+                            Violation(
+                                rule="9",
+                                code="ROOKIE_30_DAY_RESTRICTION",
+                                message=f"{player} is within 30 days of signing his rookie contract.",
+                                team=origin,
+                                player=player,
+                            )
+                        )
+
+                # Rule 10: Two-Way player, 30 days.
+                is_two_way = ov.get("is_two_way")
+                if is_two_way is None:
+                    is_two_way = "two-way" in ctype
+                if _as_bool(is_two_way) and pdata.signed_year == self.rules.season_start:
+                    signed_date = _as_date(ov.get("signed_date"))
+                    if signed_date is None:
+                        undetermined.append(
+                            f"Rule 10: signed_date missing for Two-Way player {origin} / {player}."
+                        )
+                    elif self.trade_date < signed_date + timedelta(days=30):
+                        violations.append(
+                            Violation(
+                                rule="10",
+                                code="TWO_WAY_30_DAY_RESTRICTION",
+                                message=f"{player} is within 30 days of signing a Two-Way contract.",
+                                team=origin,
+                                player=player,
+                            )
+                        )
+
+                # Rule 11: recently acquired player cannot be aggregated for
+                # two months in applicable situations.
+                acquired_date = _as_date(ov.get("acquired_date"))
+                if acquired_date is not None and outgoing_count > 1:
+                    eligible = _add_months(acquired_date, 2)
+                    if self.trade_date < eligible:
+                        violations.append(
+                            Violation(
+                                rule="11",
+                                code="RECENTLY_ACQUIRED_AGGREGATION",
+                                message=(
+                                    f"{player} was acquired on {acquired_date.isoformat()} and "
+                                    "is being aggregated with another outgoing player before "
+                                    f"{eligible.isoformat()}."
+                                ),
+                                team=origin,
+                                player=player,
+                            )
+                        )
+
+                # Rule 12: one-year Bird-rights veto.
+                if _as_bool(ov.get("bird_trade_veto")) and not _as_bool(ov.get("trade_consent")):
+                    violations.append(
+                        Violation(
+                            rule="12",
+                            code="BIRD_RIGHTS_VETO_NO_CONSENT",
+                            message=f"{player} has a Bird/Early Bird trade veto and consent is not recorded.",
+                            team=origin,
+                            player=player,
+                        )
+                    )
+
+                # Rule 13: contractual no-trade clause.
+                if _as_bool(ov.get("no_trade_clause")) and not _as_bool(ov.get("trade_consent")):
+                    violations.append(
+                        Violation(
+                            rule="13",
+                            code="NO_TRADE_CLAUSE_NO_CONSENT",
+                            message=f"{player} has a no-trade clause and consent is not recorded.",
+                            team=origin,
+                            player=player,
+                        )
+                    )
+
+                # Rule 14: matched RFA offer sheet.
+                matched_date = _as_date(ov.get("matched_rfa_date"))
+                if matched_date is not None and self.trade_date < _add_year(matched_date):
+                    if not _as_bool(ov.get("trade_consent")):
+                        violations.append(
+                            Violation(
+                                rule="14",
+                                code="MATCHED_RFA_NO_CONSENT",
+                                message=(
+                                    f"{player} is within one year of a matched RFA offer sheet "
+                                    "and consent is not recorded."
+                                ),
+                                team=origin,
+                                player=player,
+                            )
+                        )
+                    offer_team = ov.get("matched_rfa_offer_team")
+                    if offer_team and destination == offer_team:
+                        violations.append(
+                            Violation(
+                                rule="14",
+                                code="MATCHED_RFA_ORIGINAL_OFFER_TEAM",
+                                message=(
+                                    f"{player} cannot be traded to original offer-sheet team "
+                                    f"{destination} within one year of the match."
+                                ),
+                                team=origin,
+                                player=player,
+                            )
+                        )
+
+                # Rule 15: designated veteran contract/extension, one year.
+                designated_date = _as_date(ov.get("designated_veteran_signed_date"))
+                is_designated = "designated veteran" in ctype
+                if designated_date is not None:
+                    if self.trade_date < _add_year(designated_date):
+                        violations.append(
+                            Violation(
+                                rule="15",
+                                code="DESIGNATED_VETERAN_ONE_YEAR",
+                                message=(
+                                    f"{player} is within one year of a qualifying Designated "
+                                    "Veteran signing/extension."
+                                ),
+                                team=origin,
+                                player=player,
+                            )
+                        )
+                elif is_designated and pdata.signed_year == self.trade_date.year:
+                    # Any already-signed contract in the same calendar year is
+                    # necessarily less than one year old.
+                    violations.append(
+                        Violation(
+                            rule="15",
+                            code="DESIGNATED_VETERAN_SAME_YEAR",
+                            message=(
+                                f"{player}'s workbook contract is a Designated Veteran deal "
+                                f"signed in {pdata.signed_year}; on {self.trade_date.isoformat()} "
+                                "one year cannot yet have elapsed."
+                            ),
+                            team=origin,
+                            player=player,
+                        )
+                    )
+
+                # Rule 16: certain extensions/renegotiations, six months.
+                for field_name, code, label in (
+                    ("extension_signed_date", "EXTENSION_SIX_MONTH", "extension"),
+                    ("renegotiated_date", "RENEGOTIATION_SIX_MONTH", "renegotiation"),
+                ):
+                    event_date = _as_date(ov.get(field_name))
+                    if event_date is not None and self.trade_date < _add_months(event_date, 6):
+                        violations.append(
+                            Violation(
+                                rule="16",
+                                code=code,
+                                message=f"{player} is within six months of the recorded {label} date.",
+                                team=origin,
+                                player=player,
+                            )
+                        )
+
+                # Rules 17, 19, 22, 23 alter trade salary rather than always
+                # making a player categorically untradeable. Special salary
+                # fields are applied in salary matching; warn when the caller
+                # identifies a special case but omits the needed value.
+                if _as_bool(ov.get("poison_pill")) and ov.get("incoming_trade_salary") in (None, ""):
+                    undetermined.append(
+                        f"Rule 17: poison_pill=True for {origin} / {player}, but "
+                        "incoming_trade_salary override is missing."
+                    )
+                if pdata.guarantee_deadline and ov.get("outgoing_trade_salary") in (None, ""):
+                    undetermined.append(
+                        f"Rule 22: {origin} / {player} has guarantee-deadline data; "
+                        "headline salary is being used because outgoing_trade_salary was not overridden."
+                    )
+                if _as_bool(ov.get("has_trade_kicker")) and ov.get("incoming_trade_salary") in (None, ""):
+                    undetermined.append(
+                        f"Rule 23: has_trade_kicker=True for {origin} / {player}, but "
+                        "incoming_trade_salary/apron_salary was not fully overridden."
+                    )
+
+                # Rule 18: CURRENT sign-and-trade event. Historical contract
+                # type alone does not trigger this branch.
+                if _as_bool(ov.get("being_signed_and_traded")):
+                    self._validate_sign_and_trade_player(
+                        origin,
+                        destination,
+                        player,
+                        ov,
+                        violations,
+                        undetermined,
+                    )
+
+                # Rule 20: expiring contracts in the postseason trade window.
+                if self.rules.postseason_trade_window_open:
+                    expiring = pdata.contract_end == self.rules.season_start
+                    expiring = expiring or _as_bool(ov.get("could_expire_current_season"))
+                    if expiring:
+                        violations.append(
+                            Violation(
+                                rule="20",
+                                code="POSTSEASON_EXPIRING_CONTRACT",
+                                message=(
+                                    f"{player}'s contract expires, or may expire, with the current "
+                                    "season and cannot be traded in the configured postseason window "
+                                    "before the contract ends."
+                                ),
+                                team=origin,
+                                player=player,
+                            )
+                        )
+
+                # Rule 21: reacquiring a traded-and-waived player.
+                blocked = ov.get("reacquire_blocked_until_by_team") or {}
+                if isinstance(blocked, Mapping) and destination in blocked:
+                    until = _as_date(blocked[destination])
+                    if until is not None and self.trade_date < until:
+                        violations.append(
+                            Violation(
+                                rule="21",
+                                code="REACQUISITION_WAITING_PERIOD",
+                                message=(
+                                    f"{destination} cannot reacquire {player} until "
+                                    f"{until.isoformat()}."
+                                ),
+                                team=destination,
+                                player=player,
+                            )
+                        )
+
+    def _validate_sign_and_trade_player(
+        self,
+        origin: str,
+        destination: str,
+        player: str,
+        ov: Mapping[str, Any],
+        violations: List[Violation],
+        undetermined: List[str],
+    ) -> None:
+        # Rule 18 requirements directly listed in the supplied reference.
+        bool_requirements = (
+            ("sat_own_free_agent", "SIGN_AND_TRADE_NOT_OWN_FA", "player is not marked as the signing team's own free agent"),
+            (
+                "sat_finished_prior_season_on_roster",
+                "SIGN_AND_TRADE_NOT_PRIOR_ROSTER",
+                "player is not marked as having finished the prior season on the signing team's roster",
+            ),
+            (
+                "sat_first_year_fully_guaranteed",
+                "SIGN_AND_TRADE_FIRST_YEAR_NOT_GUARANTEED",
+                "first season is not marked fully guaranteed",
+            ),
+        )
+        for field_name, code, reason in bool_requirements:
+            if field_name not in ov:
+                undetermined.append(
+                    f"Rule 18: {field_name} missing for sign-and-trade player {origin} / {player}."
+                )
+            elif not _as_bool(ov.get(field_name)):
+                violations.append(
+                    Violation(
+                        rule="18",
+                        code=code,
+                        message=f"Invalid sign-and-trade for {player}: {reason}.",
+                        team=origin,
+                        player=player,
+                    )
+                )
+
+        excl = _as_int(ov.get("sat_contract_years_excluding_option"))
+        incl = _as_int(ov.get("sat_contract_years_including_option"))
+        if excl is None:
+            undetermined.append(
+                f"Rule 18: sat_contract_years_excluding_option missing for {origin} / {player}."
+            )
+        elif excl < 3:
+            violations.append(
+                Violation(
+                    rule="18",
+                    code="SIGN_AND_TRADE_TOO_SHORT",
+                    message=f"{player}'s sign-and-trade contract has fewer than three seasons excluding an option year.",
+                    team=origin,
+                    player=player,
+                )
+            )
+        if incl is None:
+            undetermined.append(
+                f"Rule 18: sat_contract_years_including_option missing for {origin} / {player}."
+            )
+        elif incl > 4:
+            violations.append(
+                Violation(
+                    rule="18",
+                    code="SIGN_AND_TRADE_TOO_LONG",
+                    message=f"{player}'s sign-and-trade contract exceeds four seasons including an option year.",
+                    team=origin,
+                    player=player,
+                )
+            )
+
+        if self.rules.regular_season_start is None:
+            undetermined.append(
+                f"Rule 18: regular_season_start is not configured for sign-and-trade {origin} / {player}."
+            )
+        elif self.trade_date >= self.rules.regular_season_start:
+            violations.append(
+                Violation(
+                    rule="18",
+                    code="SIGN_AND_TRADE_AFTER_SEASON_START",
+                    message=(
+                        f"{player}'s sign-and-trade is dated {self.trade_date.isoformat()}, "
+                        f"not before configured regular-season start {self.rules.regular_season_start.isoformat()}."
+                    ),
+                    team=origin,
+                    player=player,
+                )
+            )
+
+    # ------------------------- Rules 1-6, 17, 19, 22, 23, 31 -------------
+
+    def _validate_each_team_salary(
+        self,
+        flows: Mapping[str, TeamFlow],
+        violations: List[Violation],
+        undetermined: List[str],
+        mechanisms: Dict[str, str],
+        team_salary_detail: Dict[str, Dict[str, Money]],
+    ) -> None:
+        for team, flow in flows.items():
+            tdata = self._team_data(team)
+            if tdata is None:
+                violations.append(
+                    Violation(
+                        rule="31",
+                        code="TEAM_CAP_DATA_MISSING",
+                        message=f"No {self.rules.season_start} team cap/apron row found for {team}.",
+                        team=team,
+                    )
+                )
+                continue
+
+            missing_player = False
+            outgoing_trade_salary = 0.0
+            incoming_trade_salary = 0.0
+            outgoing_apron_salary = 0.0
+            incoming_apron_salary = 0.0
+
+            for player, _destination in flow.outgoing_players:
+                if self._player_data(team, player) is None:
+                    missing_player = True
+                    continue
+                outgoing_trade_salary += self._outgoing_trade_salary(team, player)
+                outgoing_apron_salary += self._apron_salary(team, player)
+
+            for player, origin in flow.incoming_players:
+                if self._player_data(origin, player) is None:
+                    missing_player = True
+                    continue
+                incoming_trade_salary += self._incoming_trade_salary(origin, player)
+                incoming_apron_salary += self._apron_salary(origin, player)
+
+            if missing_player:
+                undetermined.append(
+                    f"Rules 1-6/31: salary matching skipped for {team} because at least one player row is missing."
+                )
+                continue
+
+            # The workbook's first_apron_allocations is the closest supplied
+            # field to the current Apron Team Salary used by these rules.
+            pre_apron_salary = tdata.first_apron_allocations
+            post_apron_salary = pre_apron_salary - outgoing_apron_salary + incoming_apron_salary
+
+            first_apron = tdata.first_apron or self.rules.first_apron
+            second_apron = tdata.second_apron or self.rules.second_apron
+            cap_space = max(0.0, tdata.cap_space)
+
+            team_salary_detail[team] = {
+                "outgoing_trade_salary": outgoing_trade_salary,
+                "incoming_trade_salary": incoming_trade_salary,
+                "outgoing_apron_salary": outgoing_apron_salary,
+                "incoming_apron_salary": incoming_apron_salary,
+                "pretrade_apron_salary": pre_apron_salary,
+                "posttrade_apron_salary": post_apron_salary,
+                "cap_space": cap_space,
+                "first_apron": first_apron,
+                "second_apron": second_apron,
+            }
+
+            # If team only sends salary and receives none, salary matching does
+            # not prohibit the trade from this team's side.
+            if incoming_trade_salary <= 0:
+                mechanisms[team] = "no_incoming_salary"
+                continue
+
+            receiving_sat = any(
+                _as_bool(self._player_override(origin, player).get("being_signed_and_traded"))
+                for player, origin in flow.incoming_players
+            )
+            explicit_first_apron_hard_cap = _as_bool(
+                self._team_override(team).get("hard_cap_first_apron")
+            )
+
+            # Rule 18/5: receiving sign-and-trade player hard-caps at First Apron.
+            if (receiving_sat or explicit_first_apron_hard_cap) and post_apron_salary > first_apron:
+                violations.append(
+                    Violation(
+                        rule="5/18",
+                        code="FIRST_APRON_HARD_CAP_EXCEEDED",
+                        message=(
+                            f"{team} would have Apron Team Salary ${post_apron_salary:,.0f}, "
+                            f"above First Apron ${first_apron:,.0f} after a First-Apron hard-cap trigger."
+                        ),
+                        team=team,
+                    )
+                )
+                continue
+
+            mechanism = self._find_salary_matching_mechanism(
+                team=team,
+                flow=flow,
+                outgoing_salary=outgoing_trade_salary,
+                incoming_salary=incoming_trade_salary,
+                post_apron_salary=post_apron_salary,
+                first_apron=first_apron,
+                second_apron=second_apron,
+                cap_space=cap_space,
+            )
+
+            if mechanism is None:
+                violations.append(
+                    Violation(
+                        rule="1-6/31",
+                        code="SALARY_MATCHING_FAILED",
+                        message=(
+                            f"{team} cannot legally match incoming salary ${incoming_trade_salary:,.0f} "
+                            f"against outgoing salary ${outgoing_trade_salary:,.0f} using the "
+                            "cap-room, Standard TPE, Aggregated Standard TPE, Expanded TPE, or "
+                            "available existing-TPE checks implemented from the supplied reference."
+                        ),
+                        team=team,
+                    )
+                )
+            else:
+                mechanisms[team] = mechanism
+
+    def _find_salary_matching_mechanism(
+        self,
+        *,
+        team: str,
+        flow: TeamFlow,
+        outgoing_salary: Money,
+        incoming_salary: Money,
+        post_apron_salary: Money,
+        first_apron: Money,
+        second_apron: Money,
+        cap_space: Money,
+    ) -> Optional[str]:
+        n_outgoing = len(flow.outgoing_players)
+        cushion = self.rules.matching_cushion if post_apron_salary <= first_apron else 0.0
+
+        # Rule 1: team using cap space. Net incoming salary may exceed outgoing
+        # by available room plus the listed $250K cushion.
+        if cap_space > 0:
+            cap_room_max = outgoing_salary + cap_space + self.rules.matching_cushion
+            if incoming_salary <= cap_room_max:
+                return "cap_room"
+
+        # Rules 2-3 and 6: Standard matching. Multiple outgoing players may be
+        # aggregated unless doing so leaves Apron Team Salary above Second Apron.
+        aggregation_permitted = not (n_outgoing > 1 and post_apron_salary > second_apron)
+        if aggregation_permitted:
+            standard_max = outgoing_salary + cushion
+            if incoming_salary <= standard_max:
+                return "aggregated_standard_tpe" if n_outgoing > 1 else "standard_tpe"
+        elif self._can_match_without_aggregating_outgoing(team, flow):
+            # A Second-Apron team may still have multiple players in the same
+            # overall trade so long as the prohibited aggregation of outgoing
+            # salaries is not needed. Treat each outgoing salary as its own
+            # matching bucket; because the team is above the First Apron, no
+            # $250K cushion is available in these buckets.
+            return "second_apron_nonaggregated_standard"
+
+        # Rule 4: Expanded TPE tiers, available only if the resulting team can
+        # obey the First-Apron hard cap that the mechanism itself triggers.
+        if post_apron_salary <= first_apron:
+            expanded_max = self._expanded_matching_max(outgoing_salary)
+            if incoming_salary <= expanded_max:
+                return "expanded_tpe"
+
+        # Rule 31 mentions use of an existing TPE. Existing exceptions cannot
+        # be inferred from the supplied workbook today (all sections are empty),
+        # so callers can provide them via team_overrides. We use this only for
+        # salary not already matched through outgoing salary. This conservative
+        # implementation requires all incoming salary to fit a single TPE.
+        for tpe in self._active_trade_exceptions(team):
+            if tpe.amount >= incoming_salary:
+                if tpe.hard_caps_first_apron and post_apron_salary > first_apron:
+                    continue
+                return "existing_tpe"
+
+        return None
+
+    def _can_match_without_aggregating_outgoing(
+        self,
+        team: str,
+        flow: TeamFlow,
+    ) -> bool:
+        """
+        Rule 6 helper for a team left above the Second Apron.
+
+        Outgoing salaries cannot be combined. We therefore ask whether every
+        incoming player can be assigned wholly to an individual outgoing
+        player's salary bucket, allowing more than one incoming player in a
+        bucket when their combined salary fits that one outgoing salary.
+
+        This is intentionally different from summing all outgoing salaries.
+        """
+        capacities = sorted(
+            (
+                self._outgoing_trade_salary(team, player)
+                for player, _destination in flow.outgoing_players
+            ),
+            reverse=True,
+        )
+        incoming = sorted(
+            (
+                self._incoming_trade_salary(origin, player)
+                for player, origin in flow.incoming_players
+            ),
+            reverse=True,
+        )
+
+        if not incoming:
+            return True
+        if not capacities or incoming[0] > capacities[0]:
+            return False
+
+        # Small DFS/bin-packing search. Trade generators normally contain only
+        # a handful of players per team, and symmetry pruning keeps this cheap.
+        remaining = list(capacities)
+
+        def place(index: int) -> bool:
+            if index >= len(incoming):
+                return True
+
+            salary = incoming[index]
+            tried_remaining: set[float] = set()
+            for i, capacity in enumerate(remaining):
+                if capacity < salary:
+                    continue
+                rounded_capacity = round(capacity, 6)
+                if rounded_capacity in tried_remaining:
+                    continue
+                tried_remaining.add(rounded_capacity)
+
+                remaining[i] -= salary
+                if place(index + 1):
+                    return True
+                remaining[i] += salary
+
+            return False
+
+        return place(0)
+
+    def _expanded_matching_max(self, outgoing_salary: Money) -> Money:
+        if outgoing_salary <= self.rules.expanded_low_threshold:
+            return 2.0 * outgoing_salary + self.rules.matching_cushion
+        if outgoing_salary < self.rules.expanded_middle_threshold:
+            return outgoing_salary + self.rules.expanded_middle_addon
+        return 1.25 * outgoing_salary + self.rules.matching_cushion
+
+    def _active_trade_exceptions(self, team: str) -> List[TradeException]:
+        exceptions = list(self.data.trade_exceptions.get(team, ()))
+        override_entries = self._team_override(team).get("existing_tpes", ()) or ()
+
+        for entry in override_entries:
+            if isinstance(entry, TradeException):
+                exceptions.append(entry)
+                continue
+            if isinstance(entry, Mapping):
+                exceptions.append(
+                    TradeException(
+                        amount=_as_money(entry.get("amount")),
+                        expires=_as_date(entry.get("expires")),
+                        hard_caps_first_apron=_as_bool(entry.get("hard_caps_first_apron")),
+                    )
+                )
+
+        return [
+            tpe
+            for tpe in exceptions
+            if tpe.amount > 0 and (tpe.expires is None or self.trade_date <= tpe.expires)
+        ]
+
+    # ------------------------- Rule 24 cash -------------------------------
+
+    def _validate_cash(
+        self,
+        flows: Mapping[str, TeamFlow],
+        violations: List[Violation],
+        undetermined: List[str],
+        team_salary_detail: Mapping[str, Mapping[str, Money]],
+    ) -> None:
+        for team, flow in flows.items():
+            if flow.cash_sent <= 0 and flow.cash_received <= 0:
+                continue
+
+            detail = team_salary_detail.get(team)
+            if flow.cash_sent > 0 and detail is not None:
+                if detail["posttrade_apron_salary"] > detail["second_apron"]:
+                    violations.append(
+                        Violation(
+                            rule="6/24",
+                            code="SECOND_APRON_CASH_PROHIBITED",
+                            message=f"{team} cannot send cash while the transaction leaves it above the Second Apron.",
+                            team=team,
+                        )
+                    )
+
+            # A single trade above the annual limit is always impossible even
+            # without YTD data.
+            if flow.cash_sent > self.rules.annual_cash_limit:
+                violations.append(
+                    Violation(
+                        rule="24",
+                        code="CASH_SENT_SINGLE_TRADE_OVER_LIMIT",
+                        message=(
+                            f"{team} sends ${flow.cash_sent:,.0f}, above the approximate "
+                            f"2026-27 annual cash-sent limit ${self.rules.annual_cash_limit:,.0f}."
+                        ),
+                        team=team,
+                    )
+                )
+            if flow.cash_received > self.rules.annual_cash_limit:
+                violations.append(
+                    Violation(
+                        rule="24",
+                        code="CASH_RECEIVED_SINGLE_TRADE_OVER_LIMIT",
+                        message=(
+                            f"{team} receives ${flow.cash_received:,.0f}, above the approximate "
+                            f"2026-27 annual cash-received limit ${self.rules.annual_cash_limit:,.0f}."
+                        ),
+                        team=team,
+                    )
+                )
+
+            tov = self._team_override(team)
+            sent_ytd = tov.get("cash_sent_ytd")
+            received_ytd = tov.get("cash_received_ytd")
+
+            if flow.cash_sent > 0:
+                if sent_ytd is None:
+                    undetermined.append(
+                        f"Rule 24: cash_sent_ytd missing for {team}; annual aggregate cash-sent limit cannot be fully checked."
+                    )
+                elif _as_money(sent_ytd) + flow.cash_sent > self.rules.annual_cash_limit:
+                    violations.append(
+                        Violation(
+                            rule="24",
+                            code="CASH_SENT_ANNUAL_LIMIT",
+                            message=f"{team} would exceed the annual cash-sent limit.",
+                            team=team,
+                        )
+                    )
+
+            if flow.cash_received > 0:
+                if received_ytd is None:
+                    undetermined.append(
+                        f"Rule 24: cash_received_ytd missing for {team}; annual aggregate cash-received limit cannot be fully checked."
+                    )
+                elif _as_money(received_ytd) + flow.cash_received > self.rules.annual_cash_limit:
+                    violations.append(
+                        Violation(
+                            rule="24",
+                            code="CASH_RECEIVED_ANNUAL_LIMIT",
+                            message=f"{team} would exceed the annual cash-received limit.",
+                            team=team,
+                        )
+                    )
+
+    # ------------------------- Rules 25-29 draft picks --------------------
+
+    def _validate_draft_assets(
+        self,
+        flows: Mapping[str, TeamFlow],
+        violations: List[Violation],
+        undetermined: List[str],
+    ) -> None:
+        if not any(flow.outgoing_picks or flow.incoming_picks for flow in flows.values()):
+            return
+
+        max_year = self.rules.first_future_draft_year + 6
+
+        for team, flow in flows.items():
+            frozen = {
+                int(year)
+                for year in (self._team_override(team).get("frozen_first_round_years", ()) or ())
+            }
+
+            for pick in flow.outgoing_picks:
+                year = _as_int(pick.get("year"))
+                rnd = _as_int(pick.get("round"))
+                if year is None or rnd is None:
+                    violations.append(
+                        Violation(
+                            rule="25-29",
+                            code="PICK_YEAR_OR_ROUND_MISSING",
+                            message="Outgoing pick must include integer year and round.",
+                            team=team,
+                        )
+                    )
+                    continue
+
+                # Rule 25.
+                if year > max_year:
+                    violations.append(
+                        Violation(
+                            rule="25",
+                            code="PICK_BEYOND_SEVEN_DRAFTS",
+                            message=(
+                                f"{team} attempts to trade a {year} pick, beyond the configured "
+                                f"seven-future-draft horizon ending in {max_year}."
+                            ),
+                            team=team,
+                        )
+                    )
+
+                # Rule 29.
+                if rnd == 1 and year in frozen:
+                    violations.append(
+                        Violation(
+                            rule="29",
+                            code="FROZEN_FIRST_ROUND_PICK",
+                            message=f"{team}'s {year} first-round pick is marked frozen/untradeable.",
+                            team=team,
+                        )
+                    )
+
+                # Rule 27: protected picks require possible conveyance years.
+                if rnd == 1 and _as_bool(pick.get("is_protected")):
+                    possible = pick.get("possible_conveyance_years")
+                    if not possible:
+                        undetermined.append(
+                            f"Rule 27: protected first-round pick from {team} in {year} has no "
+                            "possible_conveyance_years/obligation-tree data; full Stepien validation is not possible."
+                        )
+
+        self._validate_stepien(flows, violations, undetermined)
+
+    def _guaranteed_first_round_counts(self, team: str) -> Dict[int, int]:
+        counts = {
+            year: 0
+            for year in range(
+                self.rules.first_future_draft_year,
+                self.rules.first_future_draft_year + 7,
+            )
+        }
+
+        for asset in self.data.draft_assets.get(team, ()): 
+            if asset.round != 1 or asset.draft_year not in counts:
+                continue
+
+            # An unencumbered own pick or an unconditional incoming first is a
+            # first-round selection the team possesses. An outbound swap also
+            # leaves the team with a first-round pick, consistent with Rule 28.
+            if asset.direction == "OWN":
+                counts[asset.draft_year] += 1
+            elif asset.direction == "IN" and not asset.is_conditional and not asset.is_protected:
+                counts[asset.draft_year] += 1
+            elif asset.direction == "OUT" and asset.is_swap:
+                counts[asset.draft_year] += 1
+
+        return counts
+
+    @staticmethod
+    def _stepien_bad_pairs(counts: Mapping[int, int]) -> set[Tuple[int, int]]:
+        years = sorted(counts)
+        bad: set[Tuple[int, int]] = set()
+        for a, b in zip(years, years[1:]):
+            if b == a + 1 and counts[a] <= 0 and counts[b] <= 0:
+                bad.add((a, b))
+        return bad
+
+    def _validate_stepien(
+        self,
+        flows: Mapping[str, TeamFlow],
+        violations: List[Violation],
+        undetermined: List[str],
+    ) -> None:
+        for team, flow in flows.items():
+            first_round_moves = [
+                pick
+                for pick in flow.outgoing_picks
+                if _as_int(pick.get("round")) == 1 and not _as_bool(pick.get("is_swap"))
+            ]
+            incoming_firsts = [
+                pick
+                for pick in flow.incoming_picks
+                if _as_int(pick.get("round")) == 1 and not _as_bool(pick.get("is_swap"))
+            ]
+            if not first_round_moves and not incoming_firsts:
+                continue
+
+            base = self._guaranteed_first_round_counts(team)
+            pre_bad = self._stepien_bad_pairs(base)
+
+            # Add clearly guaranteed incoming first-round picks.
+            for pick in incoming_firsts:
+                year = _as_int(pick.get("year"))
+                if year not in base:
+                    continue
+                if not _as_bool(pick.get("is_protected")) and not _as_bool(pick.get("is_conditional")):
+                    base[year] += 1
+
+            deterministic_out: List[int] = []
+            protected_options: List[List[Optional[int]]] = []
+
+            for pick in first_round_moves:
+                year = _as_int(pick.get("year"))
+                if year is None or year not in base:
+                    continue
+
+                if _as_bool(pick.get("is_protected")):
+                    possible_raw = pick.get("possible_conveyance_years") or ()
+                    possible = [
+                        int(y)
+                        for y in possible_raw
+                        if int(y) in base
+                    ]
+                    if possible:
+                        # Include None for a non-conveyance/extinguishment scenario.
+                        protected_options.append([None] + sorted(set(possible)))
+                    continue
+
+                deterministic_out.append(year)
+
+            # If a matching exact asset is supplied and the team owns multiple
+            # firsts in a year, this one decrement correctly preserves another.
+            baseline_after_deterministic = dict(base)
+            for year in deterministic_out:
+                baseline_after_deterministic[year] = max(0, baseline_after_deterministic[year] - 1)
+
+            scenarios: Iterable[Tuple[Optional[int], ...]]
+            if protected_options:
+                # Avoid pathological explosion in future expanded generators.
+                scenario_count = 1
+                for options in protected_options:
+                    scenario_count *= len(options)
+                if scenario_count > 4096:
+                    undetermined.append(
+                        f"Rule 27: protected-pick Stepien scenario count for {team} exceeds 4096; "
+                        "full obligation-tree enumeration was skipped."
+                    )
+                    scenarios = [tuple()]
+                else:
+                    scenarios = cartesian_product(*protected_options)
+            else:
+                scenarios = [tuple()]
+
+            for scenario in scenarios:
+                counts = dict(baseline_after_deterministic)
+                for conveyed_year in scenario:
+                    if conveyed_year is not None:
+                        counts[conveyed_year] = max(0, counts[conveyed_year] - 1)
+
+                post_bad = self._stepien_bad_pairs(counts)
+                new_bad = post_bad - pre_bad
+                if new_bad:
+                    pair = sorted(new_bad)[0]
+                    violations.append(
+                        Violation(
+                            rule="26-27",
+                            code="STEPIEN_RULE",
+                            message=(
+                                f"{team}'s outgoing first-round pick package can create consecutive "
+                                f"future drafts {pair[0]} and {pair[1]} with no first-round selection."
+                            ),
+                            team=team,
+                        )
+                    )
+                    break
+
+
+# ===========================================================================
+# Only public function: two arguments, no API calls, no separate modules.
+# ===========================================================================
+
+def generate_legal_two_team_trades(
+    workbook_path: str | Path,
+    user_preferences_string: str,
+) -> Iterator[Dict[str, Any]]:
+    """Generate all two-team, player-for-player trades passing known CBA checks.
+
+    Parameters
+    ----------
+    workbook_path
+        The supplied NBA engine .xlsx file.
+    user_preferences_string
+        Preferred: a JSON (or Python-literal) string with these fields:
+
+            {
+              "user_team": "New York Knicks",
+              "stage_1_players": {"New York Knicks": [...], "Atlanta Hawks": [...]},
+              "stage_2_targets": {"Atlanta Hawks": [...]},
+              "trade_date": "2026-10-08",  # optional; default: local today
+              "player_overrides": {"Team|Player": {"signed_date": "..."}},
+              "team_overrides": {"Team": {"existing_tpes": [...]}},
+              "season_rules": {"trade_deadline": "2027-02-04"}
+            }
+
+        Also accepts the upstream raw output of two consecutive Python dicts,
+        IF prefixed by a line such as "Team Name: New York Knicks".
+        The first dict is Stage 1 (allowable players). The second is Stage 2
+        (desired targets). All received players must be in Stage 2.
+
+    Returns
+    -------
+    Iterator of trade dictionaries in the previous 'trade_type'/'teams'/'moves'
+    format, with a 'cba_validation' diagnostics field. Consume with a for-loop.
+
+    Generation policy
+    -----------------
+    * Exactly two teams, always including the user's team.
+    * Each team sends >=1 player and receives >=1 player.
+    * Only Stage 1 allowable players may leave their original teams.
+    * All user-team acquisitions must be Stage 2 targets.
+    * Only 2026-27 workbook contract rows count for the current season.
+    * No draft picks or cash are ADDED by this generator.
+    * Player pre-eligibility, permissive salary ceilings, full CBA validation.
+    * No basketball-utility optimization or certification based on missing data.
+    """
+    import ast
+    import json
+    import re
+    from bisect import bisect_right
+    from dataclasses import fields, replace
+    from itertools import combinations
+
+    if not isinstance(user_preferences_string, str) or not user_preferences_string.strip():
+        raise ValueError("user_preferences_string must be a nonempty string.")
+
+    raw = user_preferences_string.strip()
+    payload = None
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        try:
+            literal = ast.literal_eval(raw)
+            if isinstance(literal, dict):
+                payload = literal
+        except (ValueError, SyntaxError):
+            pass
+
+    if isinstance(payload, dict):
+        user_team = payload.get("user_team") or payload.get("team_name")
+        stage1 = payload.get("stage_1_players", payload.get("tradeable_players"))
+        stage2 = payload.get("stage_2_targets", payload.get("wanted_players"))
+        trade_date_raw = payload.get("trade_date")
+        rules_config = payload.get("season_rules") or {}
+        player_overrides_raw = payload.get("player_overrides") or {}
+        team_overrides = payload.get("team_overrides") or {}
+    else:
+        # Parse the two UNASSIGNED dictionary expressions from GPT's Stage1/2
+        # response. Team name must be provided in the text prefix.
+        name_match = re.search(
+            r"(?im)^\s*(?:Team Name|User Team|user_team)\s*:\s*[\"']?(.+?)[\"']?\s*$",
+            raw,
+        )
+        if not name_match:
+            raise ValueError(
+                "The preference string must identify the user team. Supply "
+                "JSON with user_team, stage_1_players, stage_2_targets, or "
+                "prefix the two raw Python dictionaries with 'Team Name: ...'."
+            )
+        user_team = name_match.group(1).strip().strip("\"'")
+        start = raw.find("{")
+        if start < 0:
+            raise ValueError("Cannot find the two Stage 1/Stage 2 dictionaries.")
+        try:
+            tree = ast.parse(raw[start:], mode="exec")
+            dicts = [
+                ast.literal_eval(node.value)
+                for node in tree.body
+                if isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Dict)
+            ]
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError("Could not parse the two Stage 1/Stage 2 dictionaries.") from exc
+        if len(dicts) != 2:
+            raise ValueError("Expected exactly TWO upstream Python dictionaries.")
+        stage1, stage2 = dicts
+        trade_date_raw = None
+        rules_config = {}
+        player_overrides_raw = {}
+        team_overrides = {}
+
+    if not isinstance(user_team, str) or not user_team.strip():
+        raise ValueError("Include user_team in the preference string.")
+    user_team = user_team.strip()
+    if not isinstance(stage1, dict) or not isinstance(stage2, dict):
+        raise ValueError("Stage 1 and Stage 2 must both be dictionaries of team -> player list.")
+    if user_team not in stage1:
+        raise ValueError(f"User team {user_team!r} is missing from Stage 1.")
+
+    def normalize_player_dict(data: dict, label: str) -> Dict[str, Tuple[str, ...]]:
+        normalized = {}
+        for team, names in data.items():
+            if not isinstance(team, str) or not isinstance(names, (list, tuple)):
+                raise ValueError(f"{label} must map team names to lists of player names.")
+            if any(not isinstance(p, str) or not p.strip() for p in names):
+                raise ValueError(f"{label} contains an invalid player name for {team}.")
+            normalized[team.strip()] = tuple(sorted(set(p.strip() for p in names)))
+        return normalized
+
+    allowable = normalize_player_dict(stage1, "Stage 1")
+    targets = normalize_player_dict(stage2, "Stage 2")
+
+    if user_team in targets:
+        raise ValueError("Stage 2 must contain opposing-team targets only.")
+    for team, names in targets.items():
+        if team not in allowable:
+            raise ValueError(f"Stage 2 includes {team!r}, which was removed in Stage 1.")
+        missing = set(names) - set(allowable[team])
+        if missing:
+            raise ValueError(
+                f"Stage 2 contains excluded/non-allowable player(s) on {team}: "
+                f"{sorted(missing)!r}. Fix the upstream preference output."
+            )
+
+    if trade_date_raw:
+        execution_date = _as_date(trade_date_raw)
+    else:
+        execution_date = date.today()
+
+    if not isinstance(rules_config, dict):
+        raise ValueError("season_rules must be a dictionary when supplied.")
+    valid_rule_keys = {field.name for field in fields(SeasonRules)}
+    unknown_rule_keys = set(rules_config) - valid_rule_keys
+    if unknown_rule_keys:
+        raise ValueError(f"Unrecognized season_rules keys: {sorted(unknown_rule_keys)!r}")
+    rules_config = dict(rules_config)
+    for key in ("trade_deadline", "regular_season_start"):
+        if key in rules_config:
+            rules_config[key] = _as_date(rules_config[key])
+    rules = replace(SeasonRules(), **rules_config)
+    if rules.season_start != 2026:
+        raise ValueError(
+            "This integrated ruleset has 2026-27 financial thresholds. "
+            "Update the source rules before using it for a different season."
+        )
+
+    if not isinstance(player_overrides_raw, dict) or not isinstance(team_overrides, dict):
+        raise ValueError("player_overrides and team_overrides must be dictionaries.")
+
+    player_overrides = {}
+    for key, overrides in player_overrides_raw.items():
+        if not isinstance(overrides, dict):
+            raise ValueError("Each player override value must be a dictionary.")
+        if isinstance(key, (tuple, list)) and len(key) == 2:
+            player_key = (str(key[0]), str(key[1]))
+        elif isinstance(key, str) and "|" in key:
+            player_key = tuple(part.strip() for part in key.split("|", 1))
+        else:
+            raise ValueError(
+                "Player override keys must be 'Team|Player' (or a 2-tuple "
+                "in a Python-literal preference dictionary)."
+            )
+        player_overrides[player_key] = overrides
+
+    validator = CBAValidator.from_xlsx(
+        workbook_path,
+        trade_date=execution_date,
+        rules=rules,
+        player_overrides=player_overrides,
+        team_overrides=team_overrides,
+    )
+    data = validator.data
+
+    # Prevent stale/wrong rosters from silently becoming legal candidates.
+    for team, names in allowable.items():
+        if team not in data.teams:
+            raise ValueError(f"Stage 1 team {team!r} is absent from current workbook team data.")
+        for player in names:
+            if (team, player) not in data.players:
+                raise ValueError(
+                    f"Stage 1 player {player!r} has no 2026-27 contract record "
+                    f"for {team!r}. Re-run upstream roster/preference collection."
+                )
+
+    # Only remove a player early if the supplied validator can ALREADY PROVE
+    # a player-level violation from a single outgoing move. Restrictions on
+    # aggregated or multi-player deals are still checked on full candidates.
+    eligibility_cache: Dict[Tuple[str, str, str], bool] = {}
+
+    def individually_eligible(origin: str, name: str, destination: str) -> bool:
+        key = (origin, name, destination)
+        if key not in eligibility_cache:
+            flow = TeamFlow(
+                outgoing_players=((name, destination),),
+                incoming_players=(),
+                cash_sent=0.0,
+                cash_received=0.0,
+                outgoing_picks=(),
+                incoming_picks=(),
+            )
+            violations: List[Violation] = []
+            unknown: List[str] = []
+            validator._validate_player_ownership_and_eligibility(
+                {origin: flow}, violations, unknown
+            )
+            eligibility_cache[key] = not violations
+        return eligibility_cache[key]
+
+    # Financial pruning uses a DELIBERATELY PERMISSIVE upper bound. It can
+    # admit candidates that the full validator rejects, but it must never
+    # reject a trade that the original salary validator could have accepted.
+    max_tpe_by_team: Dict[str, float] = {}
+
+    def permissive_incoming_ceiling(team: str, outgoing: float) -> float:
+        tdata = data.teams[team]
+        if team not in max_tpe_by_team:
+            max_tpe_by_team[team] = max(
+                [0.0] + [tpe.amount for tpe in validator._active_trade_exceptions(team)]
+            )
+        return max(
+            outgoing + max(0.0, tdata.cap_space) + rules.matching_cushion,
+            outgoing + rules.matching_cushion,
+            validator._expanded_matching_max(outgoing),
+            max_tpe_by_team[team],
+        )
+
+    def user_subsets(available_names: Tuple[str, ...]):
+        # Outgoing and incoming salary can differ because of poison-pill,
+        # kicker, BYC, or other optional salary override mechanisms.
+        subsets = [(0.0, 0.0, ())]
+        for player in available_names:
+            outgoing = validator._outgoing_trade_salary(user_team, player)
+            incoming = validator._incoming_trade_salary(user_team, player)
+            subsets += [
+                (out_sum + outgoing, in_sum + incoming, names + (player,))
+                for out_sum, in_sum, names in subsets
+            ]
+        return sorted(subsets[1:], key=lambda part: part[0])
+
+    unknown_global = []
+    if rules.trade_deadline is None:
+        unknown_global.append(
+            "Rule 30: no 2026-27 trade deadline date was provided; "
+            "the trade-deadline check is undetermined."
+        )
+
+    subset_cache = {}
+
+    def iter_results() -> Iterator[Dict[str, Any]]:
+        for other_team in sorted(targets):
+            if other_team == user_team or not targets[other_team]:
+                continue
+
+            user_names = tuple(
+                name for name in allowable[user_team]
+                if individually_eligible(user_team, name, other_team)
+            )
+            target_names = tuple(
+                name for name in targets[other_team]
+                if individually_eligible(other_team, name, user_team)
+            )
+            if not user_names or not target_names:
+                continue
+
+            # Reuse user subset sums for every target combination on this team.
+            if user_names not in subset_cache:
+                subset_cache[user_names] = user_subsets(user_names)
+            outbound_subsets = subset_cache[user_names]
+            if not outbound_subsets:
+                continue
+            outbound_salaries = [part[0] for part in outbound_subsets]
+            no_special_user_salary = all(
+                abs(validator._incoming_trade_salary(user_team, name)
+                    - validator._outgoing_trade_salary(user_team, name)) < 0.01
+                for name in user_names
+            )
+
+            # Targets-only incoming subsets; no unwanted filler players.
+            # combinations() does not construct the full target power set.
+            for target_count in range(1, len(target_names) + 1):
+                for received in combinations(target_names, target_count):
+                    incoming_to_user = sum(
+                        validator._incoming_trade_salary(other_team, p)
+                        for p in received
+                    )
+                    outgoing_from_other = sum(
+                        validator._outgoing_trade_salary(other_team, p)
+                        for p in received
+                    )
+
+                    # Find the FIRST user outgoing subset that could possibly
+                    # match the required incoming salary. Monotonic bound.
+                    lo, hi = 0, len(outbound_subsets)
+                    while lo < hi:
+                        mid = (lo + hi) // 2
+                        if permissive_incoming_ceiling(
+                            user_team, outbound_salaries[mid]
+                        ) < incoming_to_user - 0.01:
+                            lo = mid + 1
+                        else:
+                            hi = mid
+                    min_index = lo
+
+                    # An opponent must ALSO be able to receive the user's
+                    # salary. When outbound and inbound salary match for
+                    # user players, bisect out impossible large offers.
+                    other_team_ceiling = permissive_incoming_ceiling(
+                        other_team, outgoing_from_other
+                    )
+                    max_index = (
+                        bisect_right(outbound_salaries, other_team_ceiling + 0.01)
+                        if no_special_user_salary
+                        else len(outbound_subsets)
+                    )
+                    if min_index >= max_index:
+                        continue
+
+                    for idx in range(min_index, max_index):
+                        outgoing_sum, opponent_incoming, sent = outbound_subsets[idx]
+                        if opponent_incoming > other_team_ceiling + 0.01:
+                            continue
+
+                        trade = {
+                            "trade_type": "2_team",
+                            "teams": (user_team, other_team),
+                            "moves": (
+                                {
+                                    "from_team": user_team,
+                                    "to_team": other_team,
+                                    "players": sent,
+                                },
+                                {
+                                    "from_team": other_team,
+                                    "to_team": user_team,
+                                    "players": received,
+                                },
+                            ),
+                        }
+                        result = validator.validate_trade(trade)
+                        if not result.passes:
+                            continue
+
+                        # Keep the validator's original financial diagnostics,
+                        # and explicitly flag checks requiring missing facts.
+                        unresolved = list(dict.fromkeys(
+                            unknown_global + result.undetermined
+                        ))
+                        trade["cba_validation"] = {
+                            "status": (
+                                "no_detected_violation_with_unresolved_checks"
+                                if unresolved
+                                else "no_detected_violation"
+                            ),
+                            "unresolved_checks": unresolved,
+                            "salary_mechanisms": result.mechanisms,
+                            "team_salary_detail": result.team_salary_detail,
+                        }
+                        yield trade
+
+    return iter_results()
+
+
+# USAGE (upstream OpenAI parsing is performed in YOUR existing pipeline):
+#
+# import json
+# preference_string = json.dumps({
+#     "user_team": "New York Knicks",
+#     "stage_1_players": stage_1_players,
+#     "stage_2_targets": stage_2_targets,
+#     "trade_date": "2026-10-08",
+# })
+#
+# trades = generate_legal_two_team_trades("nba_trade_engine_data.xlsx", preference_string)
+# for trade in trades:
+#     print(trade)
