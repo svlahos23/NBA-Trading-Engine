@@ -4069,3 +4069,366 @@ No headings, explanation, code fences, or text between dicts.
     # trades = generate_legal_two_team_trades("nba_trade_engine_data.xlsx", preference_string)
     # for trade in trades:
     #      print(trade)
+
+    # ============================================================
+    # STAGE 6 — OPTIONAL THREE-TEAM TRADE GENERATION (DISABLED)
+    # ============================================================
+    # def generate_legal_three_team_trades(
+    #     workbook_path: str | Path,
+    #     user_preferences_string: str,
+    # ) -> Iterator[Dict[str, Any]]:
+    #     """Generate all three-team, player-for-player trades passing known CBA checks.
+    #
+    #     Parameters
+    #     ----------
+    #     workbook_path
+    #         The supplied NBA engine .xlsx file.
+    #     user_preferences_string
+    #         Preferred: a JSON (or Python-literal) string with these fields:
+    #
+    #             {
+    #               "user_team": "New York Knicks",
+    #               "stage_1_players": {"New York Knicks": [...], "Atlanta Hawks": [...]},
+    #               "stage_2_targets": {"Atlanta Hawks": [...]},
+    #               "trade_date": "2026-10-08",  # optional; default: local today
+    #               "player_overrides": {"Team|Player": {"signed_date": "..."}},
+    #               "team_overrides": {"Team": {"existing_tpes": [...]}},
+    #               "season_rules": {"trade_deadline": "2027-02-04"}
+    #             }
+    #
+    #         Also accepts the upstream raw output of two consecutive Python dicts,
+    #         IF prefixed by a line such as "Team Name: New York Knicks".
+    #         The first dict is Stage 1 (allowable players). The second is Stage 2
+    #         (desired targets). All received players must be in Stage 2.
+    #
+    #     Returns
+    #     -------
+    #     Iterator of trade dictionaries in the previous 'trade_type'/'teams'/'moves'
+    #     format, with a 'cba_validation' diagnostics field. Consume with a for-loop.
+    #
+    #     Generation policy
+    #     -----------------
+    #     * Exactly three teams, always including the user's team.
+    #     * Each team sends >=1 player and receives >=1 player.
+    #     * Only Stage 1 allowable players may leave their original teams.
+    #     * All user-team acquisitions must be Stage 2 targets.
+    #     * Only 2026-27 workbook contract rows count for the current season.
+    #     * No draft picks or cash are ADDED by this generator.
+    #     * Player pre-eligibility, permissive salary ceilings, full CBA validation.
+    #     * No basketball-utility optimization or certification based on missing data.
+    #     """
+    #     import ast
+    #     import json
+    #     import re
+    #     from bisect import bisect_right
+    #     from dataclasses import fields, replace
+    #     from itertools import combinations, product
+    #
+    #     if not isinstance(user_preferences_string, str) or not user_preferences_string.strip():
+    #         raise ValueError("user_preferences_string must be a nonempty string.")
+    #
+    #     raw = user_preferences_string.strip()
+    #     payload = None
+    #     try:
+    #         payload = json.loads(raw)
+    #     except (ValueError, TypeError):
+    #         try:
+    #             literal = ast.literal_eval(raw)
+    #             if isinstance(literal, dict):
+    #                 payload = literal
+    #         except (ValueError, SyntaxError):
+    #             pass
+    #
+    #     if isinstance(payload, dict):
+    #         user_team = payload.get("user_team") or payload.get("team_name")
+    #         stage1 = payload.get("stage_1_players", payload.get("tradeable_players"))
+    #         stage2 = payload.get("stage_2_targets", payload.get("wanted_players"))
+    #         trade_date_raw = payload.get("trade_date")
+    #         rules_config = payload.get("season_rules") or {}
+    #         player_overrides_raw = payload.get("player_overrides") or {}
+    #         team_overrides = payload.get("team_overrides") or {}
+    #     else:
+    #         # Parse the two UNASSIGNED dictionary expressions from GPT's Stage1/2
+    #         # response. Team name must be provided in the text prefix.
+    #         name_match = re.search(
+    #             r"(?im)^\s*(?:Team Name|User Team|user_team)\s*:\s*[\"']?(.+?)[\"']?\s*$",
+    #             raw,
+    #         )
+    #         if not name_match:
+    #             raise ValueError(
+    #                 "The preference string must identify the user team. Supply "
+    #                 "JSON with user_team, stage_1_players, stage_2_targets, or "
+    #                 "prefix the two raw Python dictionaries with 'Team Name: ...'."
+    #             )
+    #         user_team = name_match.group(1).strip().strip("\"'")
+    #         start = raw.find("{")
+    #         if start < 0:
+    #             raise ValueError("Cannot find the two Stage 1/Stage 2 dictionaries.")
+    #         try:
+    #             tree = ast.parse(raw[start:], mode="exec")
+    #             dicts = [
+    #                 ast.literal_eval(node.value)
+    #                 for node in tree.body
+    #                 if isinstance(node, ast.Expr)
+    #                 and isinstance(node.value, ast.Dict)
+    #             ]
+    #         except (SyntaxError, ValueError) as exc:
+    #             raise ValueError("Could not parse the two Stage 1/Stage 2 dictionaries.") from exc
+    #         if len(dicts) != 2:
+    #             raise ValueError("Expected exactly TWO upstream Python dictionaries.")
+    #         stage1, stage2 = dicts
+    #         trade_date_raw = None
+    #         rules_config = {}
+    #         player_overrides_raw = {}
+    #         team_overrides = {}
+    #
+    #     if not isinstance(user_team, str) or not user_team.strip():
+    #         raise ValueError("Include user_team in the preference string.")
+    #     user_team = user_team.strip()
+    #     if not isinstance(stage1, dict) or not isinstance(stage2, dict):
+    #         raise ValueError("Stage 1 and Stage 2 must both be dictionaries of team -> player list.")
+    #     if user_team not in stage1:
+    #         raise ValueError(f"User team {user_team!r} is missing from Stage 1.")
+    #
+    #     def normalize_player_dict(data: dict, label: str) -> Dict[str, Tuple[str, ...]]:
+    #         normalized = {}
+    #         for team, names in data.items():
+    #             if not isinstance(team, str) or not isinstance(names, (list, tuple)):
+    #                 raise ValueError(f"{label} must map team names to lists of player names.")
+    #             if any(not isinstance(p, str) or not p.strip() for p in names):
+    #                 raise ValueError(f"{label} contains an invalid player name for {team}.")
+    #             normalized[team.strip()] = tuple(sorted(set(p.strip() for p in names)))
+    #         return normalized
+    #
+    #     allowable = normalize_player_dict(stage1, "Stage 1")
+    #     targets = normalize_player_dict(stage2, "Stage 2")
+    #
+    #     if user_team in targets:
+    #         raise ValueError("Stage 2 must contain opposing-team targets only.")
+    #     for team, names in targets.items():
+    #         if team not in allowable:
+    #             raise ValueError(f"Stage 2 includes {team!r}, which was removed in Stage 1.")
+    #         missing = set(names) - set(allowable[team])
+    #         if missing:
+    #             raise ValueError(
+    #                 f"Stage 2 contains excluded/non-allowable player(s) on {team}: "
+    #                 f"{sorted(missing)!r}. Fix the upstream preference output."
+    #             )
+    #
+    #     if trade_date_raw:
+    #         execution_date = _as_date(trade_date_raw)
+    #     else:
+    #         execution_date = date.today()
+    #
+    #     if not isinstance(rules_config, dict):
+    #         raise ValueError("season_rules must be a dictionary when supplied.")
+    #     valid_rule_keys = {field.name for field in fields(SeasonRules)}
+    #     unknown_rule_keys = set(rules_config) - valid_rule_keys
+    #     if unknown_rule_keys:
+    #         raise ValueError(f"Unrecognized season_rules keys: {sorted(unknown_rule_keys)!r}")
+    #     rules_config = dict(rules_config)
+    #     for key in ("trade_deadline", "regular_season_start"):
+    #         if key in rules_config:
+    #             rules_config[key] = _as_date(rules_config[key])
+    #     rules = replace(SeasonRules(), **rules_config)
+    #     if rules.season_start != 2026:
+    #         raise ValueError(
+    #             "This integrated ruleset has 2026-27 financial thresholds. "
+    #             "Update the source rules before using it for a different season."
+    #         )
+    #
+    #     if not isinstance(player_overrides_raw, dict) or not isinstance(team_overrides, dict):
+    #         raise ValueError("player_overrides and team_overrides must be dictionaries.")
+    #
+    #     player_overrides = {}
+    #     for key, overrides in player_overrides_raw.items():
+    #         if not isinstance(overrides, dict):
+    #             raise ValueError("Each player override value must be a dictionary.")
+    #         if isinstance(key, (tuple, list)) and len(key) == 2:
+    #             player_key = (str(key[0]), str(key[1]))
+    #         elif isinstance(key, str) and "|" in key:
+    #             player_key = tuple(part.strip() for part in key.split("|", 1))
+    #         else:
+    #             raise ValueError(
+    #                 "Player override keys must be 'Team|Player' (or a 2-tuple "
+    #                 "in a Python-literal preference dictionary)."
+    #             )
+    #         player_overrides[player_key] = overrides
+    #
+    #     validator = CBAValidator.from_xlsx(
+    #         workbook_path,
+    #         trade_date=execution_date,
+    #         rules=rules,
+    #         player_overrides=player_overrides,
+    #         team_overrides=team_overrides,
+    #     )
+    #     data = validator.data
+    #
+    #     # Prevent stale/wrong rosters from silently becoming legal candidates.
+    #     for team, names in allowable.items():
+    #         if team not in data.teams:
+    #             raise ValueError(f"Stage 1 team {team!r} is absent from current workbook team data.")
+    #         for player in names:
+    #             if (team, player) not in data.players:
+    #                 raise ValueError(
+    #                     f"Stage 1 player {player!r} has no 2026-27 contract record "
+    #                     f"for {team!r}. Re-run upstream roster/preference collection."
+    #                 )
+    #
+    #     # Only remove a player early if the supplied validator can ALREADY PROVE
+    #     # a player-level violation from a single outgoing move. Restrictions on
+    #     # aggregated or multi-player deals are still checked on full candidates.
+    #     eligibility_cache: Dict[Tuple[str, str, str], bool] = {}
+    #
+    #     def individually_eligible(origin: str, name: str, destination: str) -> bool:
+    #         key = (origin, name, destination)
+    #         if key not in eligibility_cache:
+    #             flow = TeamFlow(
+    #                 outgoing_players=((name, destination),),
+    #                 incoming_players=(),
+    #                 cash_sent=0.0,
+    #                 cash_received=0.0,
+    #                 outgoing_picks=(),
+    #                 incoming_picks=(),
+    #             )
+    #             violations: List[Violation] = []
+    #             unknown: List[str] = []
+    #             validator._validate_player_ownership_and_eligibility(
+    #                 {origin: flow}, violations, unknown
+    #             )
+    #             eligibility_cache[key] = not violations
+    #         return eligibility_cache[key]
+    #
+    #     # Financial pruning uses a DELIBERATELY PERMISSIVE upper bound. It can
+    #     # admit candidates that the full validator rejects, but it must never
+    #     # reject a trade that the original salary validator could have accepted.
+    #     max_tpe_by_team: Dict[str, float] = {}
+    #
+    #     def permissive_incoming_ceiling(team: str, outgoing: float) -> float:
+    #         tdata = data.teams[team]
+    #         if team not in max_tpe_by_team:
+    #             max_tpe_by_team[team] = max(
+    #                 [0.0] + [tpe.amount for tpe in validator._active_trade_exceptions(team)]
+    #             )
+    #         return max(
+    #             outgoing + max(0.0, tdata.cap_space) + rules.matching_cushion,
+    #             outgoing + rules.matching_cushion,
+    #             validator._expanded_matching_max(outgoing),
+    #             max_tpe_by_team[team],
+    #         )
+    #
+    #     def user_subsets(available_names: Tuple[str, ...]):
+    #         # Outgoing and incoming salary can differ because of poison-pill,
+    #         # kicker, BYC, or other optional salary override mechanisms.
+    #         subsets = [(0.0, 0.0, ())]
+    #         for player in available_names:
+    #             outgoing = validator._outgoing_trade_salary(user_team, player)
+    #             incoming = validator._incoming_trade_salary(user_team, player)
+    #             subsets += [
+    #                 (out_sum + outgoing, in_sum + incoming, names + (player,))
+    #                 for out_sum, in_sum, names in subsets
+    #             ]
+    #         return sorted(subsets[1:], key=lambda part: part[0])
+    #
+    #     unknown_global = []
+    #     if rules.trade_deadline is None:
+    #         unknown_global.append(
+    #             "Rule 30: no 2026-27 trade deadline date was provided; "
+    #             "the trade-deadline check is undetermined."
+    #         )
+    #
+    #
+    #     def iter_results() -> Iterator[Dict[str, Any]]:
+    #         # Exhaustive but lazy: no candidates are generated until iterated.
+    #         # The user team is ALWAYS one of the three participating teams.
+    #         opposing_teams = sorted(team for team in allowable if team != user_team)
+    #         for opponent_a, opponent_b in combinations(opposing_teams, 2):
+    #             participating = (user_team, opponent_a, opponent_b)
+    #             eligible = {}
+    #             for origin in participating:
+    #                 eligible[origin] = tuple(
+    #                     name for name in allowable[origin]
+    #                     if any(
+    #                         individually_eligible(origin, name, destination)
+    #                         for destination in participating if destination != origin
+    #                     )
+    #                 )
+    #             if any(not eligible[team] for team in participating):
+    #                 continue
+    #
+    #             player_slots = tuple(
+    #                 (origin, name)
+    #                 for origin in participating for name in eligible[origin]
+    #             )
+    #             # Each player may stay, or go to either of the other teams.
+    #             # Enumerating destinations by product avoids materializing trades.
+    #             destination_options = tuple(
+    #                 (None,) + tuple(team for team in participating if team != origin)
+    #                 for origin, _ in player_slots
+    #             )
+    #             for destinations in product(*destination_options):
+    #                 transfers = {}
+    #                 sent_counts = {team: 0 for team in participating}
+    #                 received_counts = {team: 0 for team in participating}
+    #                 user_acquisitions = 0
+    #                 valid = True
+    #                 for (origin, player), destination in zip(player_slots, destinations):
+    #                     if destination is None:
+    #                         continue
+    #                     if not individually_eligible(origin, player, destination):
+    #                         valid = False
+    #                         break
+    #                     # The user only receives explicitly shortlisted targets.
+    #                     if destination == user_team:
+    #                         if player not in targets.get(origin, ()):
+    #                             valid = False
+    #                             break
+    #                         user_acquisitions += 1
+    #                     sent_counts[origin] += 1
+    #                     received_counts[destination] += 1
+    #                     transfers.setdefault((origin, destination), []).append(player)
+    #                 if (not valid or not user_acquisitions
+    #                     or any(not sent_counts[t] or not received_counts[t]
+    #                            for t in participating)):
+    #                     continue
+    #
+    #                 # Cheap, permissive salary pruning precedes full validation.
+    #                 if any(
+    #                     sum(validator._incoming_trade_salary(src, name)
+    #                         for (src, dst), names in transfers.items()
+    #                         if dst == team for name in names)
+    #                     > permissive_incoming_ceiling(
+    #                         team,
+    #                         sum(validator._outgoing_trade_salary(team, name)
+    #                             for (src, dst), names in transfers.items()
+    #                             if src == team for name in names),
+    #                     ) + 0.01
+    #                     for team in participating
+    #                 ):
+    #                     continue
+    #
+    #                 trade = {
+    #                     "trade_type": "3_team",
+    #                     "teams": participating,
+    #                     "moves": tuple(
+    #                         {"from_team": origin, "to_team": destination,
+    #                          "players": tuple(names)}
+    #                         for (origin, destination), names in transfers.items()
+    #                     ),
+    #                 }
+    #                 result = validator.validate_trade(trade)
+    #                 if not result.passes:
+    #                     continue
+    #                 unresolved = list(dict.fromkeys(unknown_global + result.undetermined))
+    #                 trade["cba_validation"] = {
+    #                     "status": (
+    #                         "no_detected_violation_with_unresolved_checks"
+    #                         if unresolved else "no_detected_violation"
+    #                     ),
+    #                     "unresolved_checks": unresolved,
+    #                     "salary_mechanisms": result.mechanisms,
+    #                     "team_salary_detail": result.team_salary_detail,
+    #                 }
+    #                 yield trade
+    #
+    #     return iter_results()
