@@ -23,7 +23,7 @@ from dateutil.relativedelta import relativedelta
 # NBA TRADING ENGINE — ARCHITECTURE
 # Stage 1: Scrape NBA rosters and Spotrac individual trade restrictions
 # Stage 2: GPT evaluates NBA players
-# Stage 3: GPT interprets the user's trade request
+# Stage 3: GPT interprets user preferences and explicit trade logic
 # Stage 4: GPT separates required/optional acquisition and outgoing pools
 # Stage 5: Individual CBA eligibility checks (no salary calculation)
 # Stage 6: Trade generation + salary feasibility — DISABLED
@@ -32,8 +32,8 @@ from dateutil.relativedelta import relativedelta
 # ============================================================
 
 
-def big_boy(user_statement: str, api_key: str):
-    """Run the pipeline through player eligibility; print four final dictionaries.
+def big_nba_boy(user_statement: str, api_key: str):
+    """Run the pipeline through player eligibility; return four pools and required logic.
 
     Both arguments must be strings. All helper functions, data, client objects,
     and intermediate values live inside this function.
@@ -320,6 +320,21 @@ Untouchable Player Types: [traits of players never to trade]
 Players to Avoid Acquiring: [specific names]
 Player Types to Avoid Acquiring: [traits, weaknesses, roles to exclude]
 Teams to Avoid: [teams the user refuses to deal with]
+Required Trade Logic: [Python Boolean membership expressions, as quoted strings]
+
+Extract mandatory logical conditions ONLY when explicitly stated by the user.
+Use Python expressions with membership tests, AND/OR/NOT operators, parentheses,
+and the variables acquired and outgoing. Use full player names, for example:
+Required Trade Logic: ["('Giannis Antetokounmpo' in acquired or 'Jalen Brunson' in acquired)", "not ('Giannis Antetokounmpo' in acquired and 'Jalen Brunson' in acquired)", "('Karl-Anthony Towns' not in outgoing or 'Giannis Antetokounmpo' in acquired)"]
+Treat "either X or Y, but not both" as TWO expressions: the OR and the NOT-AND.
+For "trade X only if receiving Y", use "X not in outgoing or Y in acquired".
+If the user requires both X and Y, use one AND expression (or equivalent
+individual membership expressions).
+Use acquired for players the user's team RECEIVES and outgoing for players
+it SENDS. Avoid assumptions about other teams' player flows.
+Do not invent constraints from preferred or merely allowable players.
+Do not use player-type conditions, function calls, Python lambdas, or variables
+besides acquired/outgoing. If no explicit mandatory condition exists, use [].
 
 Distinguish REQUIRED from merely PREFERRED acquisitions. Explicitly naming
 someone does not necessarily make acquisition mandatory: follow the wording.
@@ -335,6 +350,61 @@ Return only the labeled fields above. No explanations or Markdown.
     )
 
     print("\nPARSED USER PREFERENCES:\n", demands.output_text)
+    # Parse the required trade-logic list separately from the preference labels.
+    logic_match = re.search(r"(?im)^Required Trade Logic:\s*(\[[^\n]*\])\s*$", demands.output_text)
+    if logic_match is None:
+        raise ValueError("GPT omitted Required Trade Logic list")
+    raw_logic = ast.literal_eval(logic_match.group(1))
+    if not isinstance(raw_logic, list) or not all(isinstance(x, str) for x in raw_logic):
+        raise ValueError("Required Trade Logic must be a list of Python expressions")
+
+    # Accept only name membership and AND/OR/NOT. Do not execute GPT-generated code.
+    # These predicates are evaluated later, once for each proposed trade.
+    def make_trade_rule(expression):
+        tree = ast.parse(expression, mode="eval")
+
+        def check_syntax(node):
+            if isinstance(node, ast.Expression):
+                return check_syntax(node.body)
+            if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
+                if len(node.values) < 2:
+                    raise ValueError("Boolean group requires at least two members")
+                for child in node.values:
+                    check_syntax(child)
+                return
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                return check_syntax(node.operand)
+            if (isinstance(node, ast.Compare) and len(node.ops) == 1
+                    and isinstance(node.ops[0], (ast.In, ast.NotIn))
+                    and isinstance(node.left, ast.Constant)
+                    and isinstance(node.left.value, str)
+                    and isinstance(node.comparators[0], ast.Name)
+                    and node.comparators[0].id in {"acquired", "outgoing"}):
+                return
+            raise ValueError(f"Unsupported trade logic expression: {expression!r}")
+
+        check_syntax(tree)
+
+        def evaluate(node, acquired, outgoing):
+            if isinstance(node, ast.Expression):
+                return evaluate(node.body, acquired, outgoing)
+            if isinstance(node, ast.BoolOp):
+                results = (evaluate(n, acquired, outgoing) for n in node.values)
+                return all(results) if isinstance(node.op, ast.And) else any(results)
+            if isinstance(node, ast.UnaryOp):
+                return not evaluate(node.operand, acquired, outgoing)
+            selected = acquired if node.comparators[0].id == "acquired" else outgoing
+            present = node.left.value in selected
+            return present if isinstance(node.ops[0], ast.In) else not present
+
+        def rule(acquired, outgoing):
+            return evaluate(tree, set(acquired), set(outgoing))
+
+        rule.expression = expression
+        return rule
+
+    required_logic = [make_trade_rule(expression) for expression in raw_logic]
+
 
     # ============================================================
     # STAGE 4 — GPT PLAYER-POOL REDUCTION AND PRIORITIZATION
@@ -391,7 +461,10 @@ DICTIONARY 4: can_trade_away
   says ONLY specific players may be traded.
 - Do NOT duplicate any player already in wanted_to_trade_away.
 
-These four dictionaries must be pairwise DISJOINT. They describe USER
+These four dictionaries must be pairwise DISJOINT. Put every explicitly required
+OR-alternative into required_targets, even if no single member is mandatory;
+the Required Trade Logic field controls acceptable combinations.
+They describe USER
 preferences only, NOT legal trade eligibility. Do not apply salary/CBA rules.
 Do NOT use external knowledge or web searches. Do NOT change a player's team.
 
@@ -522,7 +595,13 @@ No headings, explanation, code fences, or text between dicts.
     print("\nTRADEABLE TARGETS:", eligible_tradeable_targets)
     print("\nWANTED TO TRADE AWAY:", eligible_wanted_to_trade_away)
     print("\nCAN TRADE AWAY:", eligible_can_trade_away)
-    return eligible_required_targets, eligible_tradeable_targets, eligible_wanted_to_trade_away, eligible_can_trade_away
+    print("\nREQUIRED TRADE LOGIC:", [rule.expression for rule in required_logic])
+    # Check a generated trade with:
+    # all(rule(acquired_players, outgoing_players) for rule in required_logic)
+    # A constraint referencing a player excluded by Stage 5 is deliberately retained:
+    # the trade should fail rather than silently weakening the user's request.
+    return (eligible_required_targets, eligible_tradeable_targets,
+            eligible_wanted_to_trade_away, eligible_can_trade_away, required_logic)
 
     # ============================================================
     # STAGES 6–8 — DISABLED FOR NOW
